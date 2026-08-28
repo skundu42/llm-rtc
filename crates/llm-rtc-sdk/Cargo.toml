@@ -7,6 +7,7 @@ description = "High-level Rust SDK facade for llm-rtc"
 
 [dependencies]
 llm-rtc-core = { path = "../llm-rtc-core" }
+webrtc.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
