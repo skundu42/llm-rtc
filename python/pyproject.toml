@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "llm-rtc"
+version = "0.1.0"
+description = "Low-latency WebRTC library for voice LLM applications (Rust core + Python SDK)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["webrtc", "voice", "llm", "realtime", "audio"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[tool.maturin]
+python-source = "."
+module-name = "llm_rtc._llm_rtc"
+features = ["pyo3/extension-module"]

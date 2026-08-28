@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/llm-rtc-core",
     "crates/llm-rtc-sdk",
+    "python",
 ]
 
 [workspace.package]

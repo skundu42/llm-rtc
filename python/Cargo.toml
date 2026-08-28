@@ -1,0 +1,20 @@
+[package]
+name = "llm-rtc-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings for llm-rtc (low-latency WebRTC for voice LLM)"
+
+[lib]
+name = "llm_rtc"
+crate-type = ["cdylib"]
+
+[dependencies]
+llm-rtc-core = { path = "../crates/llm-rtc-core" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+tokio.workspace = true
+anyhow.workspace = true
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
