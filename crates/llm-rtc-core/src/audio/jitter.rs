@@ -5,11 +5,13 @@
 //! packets to the decoder strictly in sequence order.
 //!
 //! Design goals (low-latency-first):
-//! * Keep the buffer shallow — buffered depth is trimmed to [`JitterBufferConfig::max_latency_ms`].
-//! * Adapt quickly — inter-arrival jitter is estimated continuously with the
-//!   RFC 3550 algorithm and exposed via [`JitterStats::current_jitter_ms`].
+//! * Keep the buffer shallow — packet deadlines are capped by
+//!   [`JitterBufferConfig::max_latency_ms`].
+//! * Adapt quickly — startup delay grows from the configured target toward the
+//!   ceiling as the RFC 3550 inter-arrival jitter estimate rises.
 //! * Use RTP timestamps to map every frame onto a stable wall-clock playout
-//!   deadline after one initial [`JitterBufferConfig::target_latency_ms`] delay.
+//!   deadline after one adaptive startup delay rooted at
+//!   [`JitterBufferConfig::target_latency_ms`].
 //! * Prefer concealment over growing delay — a missing packet produces one
 //!   [`PlayoutEvent`] at its scheduled deadline and playback keeps advancing.
 
@@ -47,8 +49,8 @@ pub enum JitterError {
 /// perceives anything above ~100 ms of added buffering as a laggy turn.
 #[derive(Debug, Clone)]
 pub struct JitterBufferConfig {
-    /// Hard ceiling on buffered audio depth. Oldest packets are dropped when
-    /// the buffer would exceed this.
+    /// Hard ceiling on packet playout delay. Packets whose RTP deadlines would
+    /// keep them longer than this are discarded and concealed at playout.
     pub max_latency_ms: u32,
     /// Initial playout depth. The first RTP timestamp is mapped to its arrival
     /// time plus this delay; later frame deadlines follow the RTP timeline.
@@ -66,7 +68,7 @@ pub struct JitterBufferConfig {
 impl Default for JitterBufferConfig {
     fn default() -> Self {
         Self {
-            max_latency_ms: 60,
+            max_latency_ms: 120,
             target_latency_ms: 40,
             max_packets: 100,
             sample_rate: 48_000,
@@ -155,6 +157,14 @@ pub struct JitterStats {
     pub packets_late: u64,
     /// Current RFC 3550 inter-arrival jitter estimate, in milliseconds.
     pub current_jitter_ms: f32,
+    /// Current adaptive startup target, in milliseconds.
+    pub current_target_latency_ms: f32,
+}
+
+#[derive(Debug)]
+struct BufferedPacket {
+    packet: AudioPacket,
+    arrival: Instant,
 }
 
 /// Low-latency, adaptive jitter buffer.
@@ -168,7 +178,10 @@ pub struct JitterBuffer {
     /// Sanitized configuration.
     config: JitterBufferConfig,
     /// Buffered packets keyed by extended sequence number (total order across u16 wrap).
-    packets: BTreeMap<i64, AudioPacket>,
+    packets: BTreeMap<i64, BufferedPacket>,
+    /// Evicted packet slots retained in sequence order so each one still emits
+    /// exactly one `Missing` event at its RTP deadline.
+    evicted_slots: BTreeMap<i64, u32>,
     /// Next extended sequence number the decoder expects.
     next_seq: i64,
     /// True once the first packet anchored `next_seq` to the stream.
@@ -182,8 +195,12 @@ pub struct JitterBuffer {
     /// True after the first frame slot has been emitted. Before that point an
     /// earlier out-of-order packet may still move the stream anchor backwards.
     playout_started: bool,
+    /// Startup target after adapting to the observed inter-arrival jitter.
+    current_target_latency_ms: f64,
     /// RFC 3550 jitter estimate, in RTP timestamp units.
     jitter: f64,
+    /// Number of transit deltas incorporated into the jitter estimate.
+    jitter_samples: u32,
     /// Arrival time of the previously pushed packet (for jitter deltas).
     last_arrival: Option<Instant>,
     /// RTP timestamp of the previously pushed packet.
@@ -224,13 +241,18 @@ impl JitterBuffer {
                 frame_size_ms: config.frame_size_ms.max(1),
             },
             packets: BTreeMap::new(),
+            evicted_slots: BTreeMap::new(),
             next_seq: 0,
             started: false,
             next_timestamp: 0,
             anchor_timestamp: 0,
             anchor_deadline: None,
             playout_started: false,
+            current_target_latency_ms: f64::from(
+                config.target_latency_ms.min(config.max_latency_ms),
+            ),
             jitter: 0.0,
+            jitter_samples: 0,
             last_arrival: None,
             last_rtp_ts: None,
             now,
@@ -282,7 +304,7 @@ impl JitterBuffer {
             self.next_timestamp = packet.timestamp;
             self.anchor_timestamp = packet.timestamp;
         }
-        if self.packets.contains_key(&ext) {
+        if self.packets.contains_key(&ext) || self.evicted_slots.contains_key(&ext) {
             self.packets_dropped += 1;
             debug!(
                 seq = packet.sequence_number,
@@ -296,11 +318,18 @@ impl JitterBuffer {
             ts = packet.timestamp,
             "jitter buffer: push"
         );
-        self.packets.insert(ext, packet);
+        self.packets.insert(
+            ext,
+            BufferedPacket {
+                packet,
+                arrival: now,
+            },
+        );
         self.packets_in += 1;
         self.update_jitter(ext, now);
+        self.adapt_startup_target();
 
-        self.enforce_limits();
+        self.enforce_limits(now);
         self.packets.contains_key(&ext)
     }
 
@@ -312,7 +341,7 @@ impl JitterBuffer {
     /// events because RTP DTX can legitimately leave timestamp gaps without
     /// consuming sequence numbers.
     pub fn pop_event(&mut self) -> Option<PlayoutEvent> {
-        if !self.started || self.packets.is_empty() {
+        if !self.started || (self.packets.is_empty() && self.evicted_slots.is_empty()) {
             return None;
         }
 
@@ -321,7 +350,9 @@ impl JitterBuffer {
         let scheduled_timestamp = self
             .packets
             .get(&self.next_seq)
-            .map_or(self.next_timestamp, |packet| packet.timestamp);
+            .map(|buffered| buffered.packet.timestamp)
+            .or_else(|| self.evicted_slots.get(&self.next_seq).copied())
+            .unwrap_or(self.next_timestamp);
         let deadline = self.deadline_for(scheduled_timestamp);
         if (self.now)() < deadline {
             return None;
@@ -330,7 +361,8 @@ impl JitterBuffer {
         self.playout_started = true;
 
         // Fast path: the expected packet was buffered before its deadline.
-        if let Some(pkt) = self.packets.remove(&self.next_seq) {
+        if let Some(buffered) = self.packets.remove(&self.next_seq) {
+            let pkt = buffered.packet;
             self.next_seq += 1;
             self.next_timestamp = pkt.timestamp.wrapping_add(self.frame_ticks());
             self.packets_out += 1;
@@ -338,11 +370,35 @@ impl JitterBuffer {
             return Some(PlayoutEvent::Packet(pkt));
         }
 
+        // A resource-limit eviction is still an explicit playout slot. It was
+        // counted as dropped when evicted, so emit PLC without counting it a
+        // second time.
+        if let Some(timestamp) = self.evicted_slots.remove(&self.next_seq) {
+            let missing_seq = self.next_seq;
+            self.next_seq += 1;
+            self.next_timestamp = timestamp.wrapping_add(self.frame_ticks());
+            debug!(
+                missing = missing_seq as u16,
+                "jitter buffer: emitting missing event for evicted packet"
+            );
+            return Some(PlayoutEvent::Missing {
+                sequence_number: missing_seq as u16,
+                timestamp,
+            });
+        }
+
         // A later buffered packet proves this sequence slot was lost. Advance
         // one slot only so every missing frame gets one PLC/FEC opportunity.
         let missing_seq = self.next_seq;
         let missing_timestamp = self.next_timestamp;
-        let next_key = *self.packets.keys().next().expect("non-empty checked above");
+        let next_packet_key = self.packets.keys().next().copied();
+        let next_evicted_key = self.evicted_slots.keys().next().copied();
+        let next_key = match (next_packet_key, next_evicted_key) {
+            (Some(packet), Some(evicted)) => packet.min(evicted),
+            (Some(packet), None) => packet,
+            (None, Some(evicted)) => evicted,
+            (None, None) => unreachable!("pending state checked above"),
+        };
         debug_assert!(next_key > missing_seq);
         self.next_seq += 1;
         self.next_timestamp = missing_timestamp.wrapping_add(self.frame_ticks());
@@ -352,11 +408,12 @@ impl JitterBuffer {
             "jitter buffer: packet missing at playout deadline"
         );
 
-        if next_key == missing_seq + 1 {
+        if next_packet_key == Some(missing_seq + 1) {
             let next_packet = self
                 .packets
-                .get(&next_key)
+                .get(&(missing_seq + 1))
                 .expect("next_key was just taken from the map")
+                .packet
                 .clone();
             Some(PlayoutEvent::RecoveredWithNextPacket {
                 sequence_number: missing_seq as u16,
@@ -391,24 +448,28 @@ impl JitterBuffer {
             packets_dropped: self.packets_dropped,
             packets_late: self.packets_late,
             current_jitter_ms: self.current_jitter_ms(),
+            current_target_latency_ms: self.current_target_latency_ms as f32,
         }
     }
 
     /// Whether packets are still waiting for their RTP playout deadlines.
     pub fn has_pending(&self) -> bool {
-        !self.packets.is_empty()
+        !self.packets.is_empty() || !self.evicted_slots.is_empty()
     }
 
     /// Reset all state for a new stream (keeps the configuration).
     pub fn clear(&mut self) {
         self.packets.clear();
+        self.evicted_slots.clear();
         self.started = false;
         self.next_seq = 0;
         self.next_timestamp = 0;
         self.anchor_timestamp = 0;
         self.anchor_deadline = None;
         self.playout_started = false;
+        self.current_target_latency_ms = f64::from(self.config.target_latency_ms);
         self.jitter = 0.0;
+        self.jitter_samples = 0;
         self.last_arrival = None;
         self.last_rtp_ts = None;
         self.packets_in = 0;
@@ -420,7 +481,7 @@ impl JitterBuffer {
 
     /// Initial wall-clock buffering delay.
     fn target_latency(&self) -> Duration {
-        Duration::from_millis(u64::from(self.config.target_latency_ms))
+        Duration::from_secs_f64(self.current_target_latency_ms / 1_000.0)
     }
 
     /// RTP timestamp ticks in one configured audio frame.
@@ -438,54 +499,69 @@ impl JitterBuffer {
             + delta
     }
 
-    /// Enforce the packet-count and latency ceilings after an insert.
-    fn enforce_limits(&mut self) {
+    /// Enforce the packet-count and RTP-deadline latency ceilings after an
+    /// insert.
+    fn enforce_limits(&mut self, now: Instant) {
         // Capacity safety valve (protects against unbounded memory use).
         while self.packets.len() > self.config.max_packets {
-            self.evict_oldest("capacity");
+            let key = *self
+                .packets
+                .keys()
+                .next_back()
+                .expect("capacity overflow implies a packet exists");
+            self.evict_packet(key, "capacity");
         }
 
-        // Depth ceiling: approximate buffered audio duration as
-        // (buffered frames) * (frame duration). This is the playout latency
-        // the oldest buffered packet would add, which is exactly what the
-        // low-latency policy wants to bound.
-        let frame_ms = u64::from(self.config.frame_size_ms);
-        let max_ms = u64::from(self.config.max_latency_ms);
-        while self.packets.len() > 1 && self.packets.len() as u64 * frame_ms > max_ms {
-            self.evict_oldest("max_latency");
+        // A packet's real buffering cost is the time from arrival until its
+        // RTP-derived deadline (or until now if that deadline is overdue).
+        // Counting packets confuses sparse timestamps, reordering, and DTX
+        // with latency, so remove only slots whose measured/projected residence
+        // exceeds the configured ceiling.
+        let max_latency = Duration::from_millis(u64::from(self.config.max_latency_ms));
+        let over_limit: Vec<_> = self
+            .packets
+            .iter()
+            .filter_map(|(&key, buffered)| {
+                let deadline = self.deadline_for(buffered.packet.timestamp);
+                let playout_at = deadline.max(now);
+                (playout_at.duration_since(buffered.arrival) > max_latency).then_some(key)
+            })
+            .collect();
+        for key in over_limit {
+            self.evict_packet(key, "max_latency");
         }
     }
 
-    /// Remove the oldest buffered packet, counting it as dropped.
-    fn evict_oldest(&mut self, reason: &str) {
-        if let Some((key, pkt)) = self.packets.pop_first() {
-            let skipped = if key >= self.next_seq {
-                (key - self.next_seq + 1) as u64
-            } else {
-                1
-            };
-            self.packets_dropped += skipped;
+    /// Remove one buffered packet while preserving its RTP slot for PLC.
+    fn evict_packet(&mut self, key: i64, reason: &str) {
+        if let Some(buffered) = self.packets.remove(&key) {
+            let packet = buffered.packet;
+            self.packets_dropped += 1;
+            self.evicted_slots.insert(key, packet.timestamp);
             debug!(
-                seq = pkt.sequence_number,
-                skipped, reason, "jitter buffer: evicting oldest packet"
+                seq = packet.sequence_number,
+                reason, "jitter buffer: evicting packet and queuing missing event"
             );
-            if key >= self.next_seq {
-                // Capacity pressure intentionally skips old audio to bound
-                // latency. Advance every part of the playout cursor together
-                // so the evicted slot is not later counted or concealed again.
-                self.next_seq = key + 1;
-                self.next_timestamp = pkt.timestamp.wrapping_add(self.frame_ticks());
+        }
+    }
 
-                // Before startup, make the oldest survivor the new RTP anchor
-                // while retaining the original wall-clock startup deadline.
-                if !self.playout_started {
-                    if let Some((&next_key, next_packet)) = self.packets.first_key_value() {
-                        self.next_seq = next_key;
-                        self.next_timestamp = next_packet.timestamp;
-                        self.anchor_timestamp = next_packet.timestamp;
-                    }
-                }
-            }
+    /// Raise the startup target to cover four jitter deviations. Deadlines are
+    /// never moved after playout begins because doing so would break the stable
+    /// frame clock; later spikes are handled by FEC/PLC.
+    fn adapt_startup_target(&mut self) {
+        if self.playout_started || self.config.target_latency_ms == 0 || self.jitter_samples < 2 {
+            return;
+        }
+        let desired = (f64::from(self.config.target_latency_ms)
+            + 4.0 * f64::from(self.current_jitter_ms()))
+        .min(f64::from(self.config.max_latency_ms));
+        if desired <= self.current_target_latency_ms {
+            return;
+        }
+        let increase = desired - self.current_target_latency_ms;
+        self.current_target_latency_ms = desired;
+        if let Some(deadline) = self.anchor_deadline {
+            self.anchor_deadline = Some(deadline + Duration::from_secs_f64(increase / 1_000.0));
         }
     }
 
@@ -498,10 +574,12 @@ impl JitterBuffer {
     /// (converted with wrapping arithmetic so u32 timestamp wraparound is
     /// handled), and the first packet of a stream only initializes state.
     fn update_jitter(&mut self, ext: i64, now: Instant) {
-        let packet = self
+        let timestamp = self
             .packets
             .get(&ext)
-            .expect("accepted packet was inserted before jitter update");
+            .expect("accepted packet was inserted before jitter update")
+            .packet
+            .timestamp;
         if let (Some(prev_arrival), Some(prev_ts)) = (self.last_arrival, self.last_rtp_ts) {
             // Arrival spacing expressed in RTP ticks (fractional ticks are
             // rounded; the /16 smoothing makes the error negligible).
@@ -509,12 +587,13 @@ impl JitterBuffer {
                 * f64::from(self.config.sample_rate))
             .round() as i64;
             // Timestamp spacing, signed and wrap-safe.
-            let ts_delta = i64::from(packet.timestamp.wrapping_sub(prev_ts) as i32);
+            let ts_delta = i64::from(timestamp.wrapping_sub(prev_ts) as i32);
             let d = arrival_delta - ts_delta;
             self.jitter += (d.abs() as f64 - self.jitter) / 16.0;
+            self.jitter_samples += 1;
         }
         self.last_arrival = Some(now);
-        self.last_rtp_ts = Some(packet.timestamp);
+        self.last_rtp_ts = Some(timestamp);
     }
 
     /// Current jitter estimate converted from RTP ticks to milliseconds.
@@ -863,17 +942,72 @@ mod tests {
         ));
     }
 
-    /// (l) Capacity eviction advances the complete playout cursor and does not
-    /// count or conceal the same discarded slot a second time.
+    /// (l) Every capacity eviction remains an explicit missing playout slot.
     #[test]
-    fn startup_eviction_reanchors_without_double_counting_loss() {
-        let mut jb = JitterBuffer::new(cfg(40, 0));
-        jb.push(pkt(1));
-        jb.push(pkt(2));
-        assert!(!jb.push(pkt(0))); // new oldest frame exceeds the ceiling
+    fn capacity_eviction_queues_one_missing_event() {
+        let clock = MockClock::new();
+        let mut config = cfg(200, 0);
+        config.max_packets = 2;
+        let mut jb = jb_with_clock(config, &clock);
+        assert!(jb.push(pkt(0)));
+        assert!(jb.push(pkt(1)));
+        assert!(!jb.push(pkt(2)), "farthest-future packet is evicted");
 
         assert_eq!(jb.stats().packets_dropped, 1);
+        assert_eq!(jb.pop().unwrap().sequence_number, 0);
+        clock.advance(Duration::from_millis(20));
         assert_eq!(jb.pop().unwrap().sequence_number, 1);
+        clock.advance(Duration::from_millis(20));
+        assert!(matches!(
+            jb.pop_event(),
+            Some(PlayoutEvent::Missing {
+                sequence_number: 2,
+                ..
+            })
+        ));
+        assert_eq!(jb.stats().packets_dropped, 1, "eviction counted once");
+        assert!(!jb.has_pending());
+    }
+
+    /// (m) The latency ceiling uses RTP deadlines and arrival times rather
+    /// than treating sparse buffered packets as contiguous frame depth.
+    #[test]
+    fn latency_ceiling_uses_rtp_deadlines() {
+        let clock = MockClock::new();
+        let mut jb = jb_with_clock(cfg(100, 0), &clock);
+        assert!(jb.push(pkt_at(0, 0)));
+
+        // Only one additional packet is present, but it arrived 200 ms before
+        // its RTP deadline and must therefore be evicted by the 100 ms ceiling.
+        assert!(!jb.push(pkt_at(1, 9_600)));
         assert_eq!(jb.stats().packets_dropped, 1);
+        assert_eq!(jb.pop().unwrap().sequence_number, 0);
+        clock.advance(Duration::from_millis(200));
+        assert!(matches!(
+            jb.pop_event(),
+            Some(PlayoutEvent::Missing {
+                sequence_number: 1,
+                timestamp: 9_600,
+            })
+        ));
+    }
+
+    /// (n) Observed startup jitter raises the target beyond its configured
+    /// floor without exceeding the hard ceiling.
+    #[test]
+    fn startup_target_adapts_to_jitter() {
+        let clock = MockClock::new();
+        let mut jb = jb_with_clock(cfg(120, 40), &clock);
+        jb.push(pkt(0));
+        clock.advance(Duration::from_millis(40));
+        jb.push(pkt(1));
+        clock.advance(Duration::from_millis(1));
+        jb.push(pkt(2));
+
+        let stats = jb.stats();
+        assert!(stats.current_jitter_ms > 0.0);
+        assert!(stats.current_target_latency_ms > 40.0);
+        assert!(stats.current_target_latency_ms <= 120.0);
+        assert!(jb.pop_event().is_none(), "adaptation extended startup");
     }
 }

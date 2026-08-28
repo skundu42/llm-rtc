@@ -107,9 +107,9 @@ The main knobs, from codec to capture:
   - DTX: stop transmitting during silence
   - FEC: in-band forward error correction for lossy links
 - **`JitterBufferConfig`** (`llm_rtc_core::audio::jitter`)
-  - `target_latency_ms`: playout depth; lower is snappier, higher tolerates
-    more network jitter
-  - `max_latency_ms`: hard ceiling; oldest audio is dropped above it
+  - `target_latency_ms`: minimum startup depth; lower is snappier
+  - `max_latency_ms`: adaptive target and packet-residence ceiling; packets
+    discarded above it still produce PLC at their RTP playout slots
 - **`ProcessorConfig`** (`llm_rtc_core::audio::processor`)
   - `enable_aec`, `enable_ns`, `enable_agc`, `enable_vad`: WebRTC audio
     processing modules; AEC needs a far-end reference

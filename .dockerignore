@@ -1,0 +1,5 @@
+.git
+target
+**/target
+benchmarks/neteq-comparison/results*
+**/.DS_Store

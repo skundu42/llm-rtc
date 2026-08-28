@@ -11,3 +11,4 @@ __pycache__/
 .venv/
 .idea/
 .vscode/
+/benchmarks/neteq-comparison/results/

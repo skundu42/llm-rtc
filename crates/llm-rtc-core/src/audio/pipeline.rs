@@ -324,4 +324,91 @@ mod tests {
         assert_eq!(stats.packets_out, 2);
         assert!(!pipeline.has_pending_playout());
     }
+
+    /// The deterministic severe benchmark trace must still produce one
+    /// decoded frame per RTP slot. Payload loss may select FEC/PLC, but buffer
+    /// pressure must never silently shorten the stream.
+    #[test]
+    fn severe_jitter_trace_preserves_decoded_frame_continuity() {
+        const CONTENT_FRAMES: usize = 500;
+        const GUARD_FRAMES: usize = 5;
+
+        let config = AudioPipelineConfig {
+            jitter: JitterBufferConfig {
+                target_latency_ms: 40,
+                max_latency_ms: 120,
+                ..JitterBufferConfig::default()
+            },
+            ..AudioPipelineConfig::default()
+        };
+        let encoder = OpusEncoder::new(config.codec.clone()).unwrap();
+        let base = Instant::now();
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let clock_elapsed = Arc::clone(&elapsed);
+        let mut pipeline = pipeline_with_clock(
+            config,
+            Box::new(move || base + *clock_elapsed.lock().unwrap()),
+        );
+
+        let mut random_state = 0xa5a5_5a5a_u32;
+        let mut random = || {
+            random_state ^= random_state << 13;
+            random_state ^= random_state >> 17;
+            random_state ^= random_state << 5;
+            f64::from(random_state) / f64::from(u32::MAX)
+        };
+        let mut offset = 0;
+        let mut arrivals = Vec::new();
+        for frame_index in 0..(CONTENT_FRAMES + GUARD_FRAMES) {
+            let is_guard = frame_index >= CONTENT_FRAMES;
+            let jitter_ms = if is_guard {
+                0.0
+            } else {
+                (random() * 2.0 - 1.0) * 40.0
+            };
+            let dropped = !is_guard && frame_index != 0 && random() < 0.10;
+            let frame = if is_guard {
+                vec![0; FRAME_SAMPLES]
+            } else {
+                let frame = sine_frame(48_000, &mut offset);
+                offset += FRAME_SAMPLES;
+                frame
+            };
+            let payload = encoder.encode(&frame).unwrap();
+            if !dropped {
+                arrivals.push((
+                    frame_index as f64 * 20.0 + 50.0 + jitter_ms,
+                    AudioPacket {
+                        sequence_number: 10_000_u16.wrapping_add(frame_index as u16),
+                        timestamp: 900_000_u32.wrapping_add((frame_index * FRAME_SAMPLES) as u32),
+                        payload,
+                    },
+                ));
+            }
+        }
+        arrivals.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
+
+        let end_ms = arrivals.last().unwrap().0 + 2_000.0;
+        let mut next_arrival = 0;
+        let mut decoded_frames = 0;
+        let mut tick_ms = 0.0;
+        while tick_ms <= end_ms && decoded_frames < CONTENT_FRAMES {
+            while next_arrival < arrivals.len() && arrivals[next_arrival].0 <= tick_ms {
+                let (arrival_ms, packet) = &arrivals[next_arrival];
+                *elapsed.lock().unwrap() = Duration::from_secs_f64(*arrival_ms / 1_000.0);
+                pipeline.push_incoming(packet.clone());
+                next_arrival += 1;
+            }
+            *elapsed.lock().unwrap() = Duration::from_secs_f64(tick_ms / 1_000.0);
+            if pipeline.pop_decoded().unwrap().is_some() {
+                decoded_frames += 1;
+            }
+            tick_ms += 20.0;
+        }
+
+        assert_eq!(
+            decoded_frames, CONTENT_FRAMES,
+            "severe trace silently lost a decoded playout slot"
+        );
+    }
 }

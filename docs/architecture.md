@@ -85,16 +85,18 @@ before it is needed. They grow under jitter and hold tens or hundreds of
 milliseconds of audio. For a voice conversation that growth is fatal to
 interactivity, so llm-rtc's buffer implements the opposite policy:
 
-- **Fixed playout target.** `JitterBufferConfig::target_latency_ms` is the
-  playout depth. `pop()` returns audio as soon as the buffer holds the
-  target; it does not expand the target when the network gets rough.
+- **Adaptive startup target.** `JitterBufferConfig::target_latency_ms` is the
+  minimum playout depth. Before playout begins, the target grows toward
+  `max_latency_ms` using four times the RFC 3550 inter-arrival jitter estimate.
+  Once playout starts, RTP deadlines stay fixed on the 20 ms clock.
 - **Bounded wait for loss.** If the next expected packet has not arrived
   within the target window, `pop()` stops waiting, declares it lost, and
   advances the sequence. The caller plays a gap (the decoder's FEC/PLC can
   fill in) instead of accumulating delay.
-- **Hard ceiling.** `max_latency_ms` and `max_packets` cap how much can be
-  buffered at all; when the ceiling is hit the oldest audio is dropped.
-  This bounds worst-case latency and memory during long stalls.
+- **Hard ceiling.** `max_latency_ms` caps actual/projected packet residence,
+  measured from arrival to its RTP-derived deadline; `max_packets` is a memory
+  safety valve. Discarded packets remain queued as missing playout slots, so
+  the decoder produces PLC instead of silently shortening the stream.
 
 The trade-off is explicit: under sustained packet loss or severe jitter
 this policy produces audible gaps where a classical buffer would produce a

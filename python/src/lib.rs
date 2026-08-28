@@ -123,7 +123,7 @@ struct PyJitterBufferConfig {
 impl PyJitterBufferConfig {
     #[new]
     #[pyo3(signature = (
-        max_latency_ms = 60,
+        max_latency_ms = 120,
         target_latency_ms = 40,
         max_packets = 100,
         sample_rate = 48_000,
@@ -214,6 +214,11 @@ impl PyJitterStats {
     #[getter]
     fn current_jitter_ms(&self) -> f32 {
         self.inner.current_jitter_ms
+    }
+
+    #[getter]
+    fn current_target_latency_ms(&self) -> f32 {
+        self.inner.current_target_latency_ms
     }
 }
 

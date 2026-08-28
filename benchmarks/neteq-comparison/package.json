@@ -1,0 +1,10 @@
+{
+  "name": "llm-rtc-neteq-comparison",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Identical RTP trace comparison between llm-rtc and Chromium NetEq",
+  "license": "MIT",
+  "dependencies": {
+    "@roamhq/wrtc": "0.10.0"
+  }
+}
