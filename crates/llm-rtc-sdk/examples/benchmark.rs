@@ -152,8 +152,12 @@ fn bench_compression() {
 }
 
 fn bench_latency() {
-    println!("\n=== C. END-TO-END PIPELINE LATENCY ===");
-    let cfg = AudioPipelineConfig::default();
+    println!("\n=== C. PIPELINE COMPUTE COST ===");
+    // This section measures synchronous compute cost, not wall-clock playout.
+    // Disable startup buffering and use one synthetic RTP instant so the
+    // jitter buffer does not intentionally pace the tight benchmark loop.
+    let mut cfg = AudioPipelineConfig::default();
+    cfg.jitter.target_latency_ms = 0;
     let mut pipe = AudioPipeline::new(cfg).unwrap();
     let codec_spf = 960; // 20 ms @ 48 kHz
 
@@ -170,13 +174,13 @@ fn bench_latency() {
     let start = Instant::now();
     let mut decoded_frames = 0usize;
     let mut seq = 0u16;
-    for i in 0..n {
+    for _ in 0..n {
         let mut f = frame.clone();
         let packets = pipe.process_outgoing(&mut f).unwrap();
         for pkt in &packets {
             let ap = AudioPacket {
                 sequence_number: seq,
-                timestamp: (i as u32) * 960,
+                timestamp: 0,
                 payload: pkt.clone(),
             };
             seq = seq.wrapping_add(1);
@@ -190,7 +194,7 @@ fn bench_latency() {
     let wall = start.elapsed().as_secs_f64();
     let per_frame_us = wall * 1_000_000.0 / n as f64;
     println!("{n} frames round-tripped in {wall:.3} s");
-    println!("  per-frame algorithmic latency = {per_frame_us:.1} us");
+    println!("  per-frame compute time = {per_frame_us:.1} us");
     println!(
         "  ({:.0} frames/s full pipeline throughput)",
         n as f64 / wall

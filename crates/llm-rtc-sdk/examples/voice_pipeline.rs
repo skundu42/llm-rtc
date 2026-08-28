@@ -73,10 +73,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Simulate the network and the receiving side in a streaming fashion:
     // each encoded payload is wrapped in an AudioPacket (sequence number +
-    // RTP timestamp) and pushed into the jitter buffer as it "arrives", then
-    // the playout side immediately pops and decodes whatever is in order.
-    // This mirrors how a real call interleaves arrival and playout instead
-    // of buffering the whole stream up front.
+    // RTP timestamp) and pushed into the jitter buffer as it "arrives". A
+    // 20 ms media clock independently asks for the frame whose RTP deadline
+    // is due, matching the scheduling used by VoiceLlmSession.
     let samples_per_frame = SAMPLE_RATE * 20 / 1000; // 20 ms frames
     let mut decoded_samples = 0usize;
     let mut decoded_frames = 0usize;
@@ -88,8 +87,18 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         };
         pipeline.push_incoming(packet);
 
-        // Pop and decode any packets that are ready to play out.
-        while let Some(frame) = pipeline.pop_decoded()? {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        if let Some(frame) = pipeline.pop_decoded()? {
+            decoded_samples += frame.len();
+            decoded_frames += 1;
+        }
+    }
+
+    // The initial target depth leaves a small tail after the final arrival.
+    // Continue the media clock until every buffered RTP frame is played.
+    while pipeline.has_pending_playout() {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        if let Some(frame) = pipeline.pop_decoded()? {
             decoded_samples += frame.len();
             decoded_frames += 1;
         }

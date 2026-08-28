@@ -18,7 +18,9 @@ use thiserror::Error;
 use tracing::debug;
 
 use crate::audio::codec::{CodecConfig, OpusDecoder, OpusEncoder};
-use crate::audio::jitter::{AudioPacket, JitterBuffer, JitterBufferConfig, JitterStats};
+use crate::audio::jitter::{
+    AudioPacket, JitterBuffer, JitterBufferConfig, JitterStats, PlayoutEvent,
+};
 use crate::audio::processor::{AudioProcessor, ProcessorConfig, ProcessorStats};
 
 /// Errors produced by the audio pipeline.
@@ -126,24 +128,34 @@ impl AudioPipeline {
     /// Returns `true` if the packet was accepted, `false` if it was dropped
     /// (e.g. duplicate, too late, or the buffer is overflowing).
     pub fn push_incoming(&mut self, packet: AudioPacket) -> bool {
-        // The jitter buffer absorbs duplicates/overflows internally; the
-        // pipeline always reports the packet as accepted.
-        self.jitter.push(packet);
-        true
+        self.jitter.push(packet)
     }
 
     /// Pop and decode the next in-order packet, if one is ready.
     ///
-    /// Returns `None` when the jitter buffer has nothing to play out yet
-    /// (no packets, or still waiting on a gap within the target latency).
+    /// Returns `None` when the jitter buffer has nothing to play out at the
+    /// current RTP deadline. Missing slots return concealed PCM via PLC or FEC.
     pub fn pop_decoded(&mut self) -> Result<Option<Vec<i16>>> {
-        match self.jitter.pop() {
-            Some(packet) => {
-                let pcm = self.decoder.decode(&packet.payload)?;
-                Ok(Some(pcm))
+        let Some(event) = self.jitter.pop_event() else {
+            return Ok(None);
+        };
+
+        let pcm = match event {
+            PlayoutEvent::Packet(packet) => self.decoder.decode(&packet.payload)?,
+            PlayoutEvent::Missing { .. } => self.decoder.decode(&[])?,
+            PlayoutEvent::RecoveredWithNextPacket { next_packet, .. }
+                if self.decoder.config().use_fec =>
+            {
+                self.decoder.decode_fec(&next_packet.payload)?
             }
-            None => Ok(None),
-        }
+            PlayoutEvent::RecoveredWithNextPacket { .. } => self.decoder.decode(&[])?,
+        };
+        Ok(Some(pcm))
+    }
+
+    /// Whether received packets are still waiting for playout.
+    pub fn has_pending_playout(&self) -> bool {
+        self.jitter.has_pending()
     }
 
     /// Snapshot of the jitter buffer statistics.
@@ -179,6 +191,8 @@ impl AudioPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     /// Samples per 20 ms frame at 48 kHz mono.
     const FRAME_SAMPLES: usize = 960;
@@ -192,6 +206,18 @@ mod tests {
             })
             .map(|s| s as i16)
             .collect()
+    }
+
+    fn pipeline_with_clock(
+        config: AudioPipelineConfig,
+        now: Box<dyn Fn() -> Instant + Send + Sync>,
+    ) -> AudioPipeline {
+        AudioPipeline {
+            encoder: OpusEncoder::new(config.codec.clone()).unwrap(),
+            decoder: OpusDecoder::new(config.codec.clone()).unwrap(),
+            jitter: JitterBuffer::with_clock(config.jitter, now),
+            processor: AudioProcessor::new(config.processor).unwrap(),
+        }
     }
 
     #[test]
@@ -212,7 +238,13 @@ mod tests {
 
     #[test]
     fn push_incoming_then_pop_decoded_round_trips() {
-        let config = AudioPipelineConfig::default();
+        let config = AudioPipelineConfig {
+            jitter: JitterBufferConfig {
+                target_latency_ms: 0,
+                ..JitterBufferConfig::default()
+            },
+            ..AudioPipelineConfig::default()
+        };
         let mut pipeline = AudioPipeline::new(config.clone()).unwrap();
 
         // Encode a sine wave with a standalone encoder using the same config.
@@ -239,5 +271,57 @@ mod tests {
 
         // Reset should also be callable without panicking.
         pipeline.reset();
+    }
+
+    #[test]
+    fn consecutive_losses_use_plc_then_fec_and_preserve_next_packet() {
+        let config = AudioPipelineConfig {
+            jitter: JitterBufferConfig {
+                target_latency_ms: 0,
+                max_latency_ms: 200,
+                ..JitterBufferConfig::default()
+            },
+            ..AudioPipelineConfig::default()
+        };
+        let encoder = OpusEncoder::new(config.codec.clone()).unwrap();
+        let mut offset = 0;
+        let mut payloads = Vec::new();
+        for _ in 0..4 {
+            let frame = sine_frame(48_000, &mut offset);
+            offset += FRAME_SAMPLES;
+            payloads.push(encoder.encode(&frame).unwrap());
+        }
+
+        let base = Instant::now();
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let clock_elapsed = Arc::clone(&elapsed);
+        let mut pipeline = pipeline_with_clock(
+            config,
+            Box::new(move || base + *clock_elapsed.lock().unwrap()),
+        );
+
+        // Packets 1 and 2 are lost. Slot 1 has no adjacent future packet and
+        // uses PLC; slot 2 can recover from packet 3's in-band FEC data.
+        for seq in [0u16, 3] {
+            assert!(pipeline.push_incoming(AudioPacket {
+                sequence_number: seq,
+                timestamp: u32::from(seq) * FRAME_SAMPLES as u32,
+                payload: payloads[usize::from(seq)].clone(),
+            }));
+        }
+
+        for expected_slot in 0..4 {
+            let decoded = pipeline
+                .pop_decoded()
+                .unwrap()
+                .unwrap_or_else(|| panic!("slot {expected_slot} should be due"));
+            assert_eq!(decoded.len(), FRAME_SAMPLES);
+            *elapsed.lock().unwrap() += Duration::from_millis(20);
+        }
+
+        let stats = pipeline.jitter_stats();
+        assert_eq!(stats.packets_dropped, 2);
+        assert_eq!(stats.packets_out, 2);
+        assert!(!pipeline.has_pending_playout());
     }
 }

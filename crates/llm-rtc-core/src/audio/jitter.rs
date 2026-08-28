@@ -8,9 +8,10 @@
 //! * Keep the buffer shallow — buffered depth is trimmed to [`JitterBufferConfig::max_latency_ms`].
 //! * Adapt quickly — inter-arrival jitter is estimated continuously with the
 //!   RFC 3550 algorithm and exposed via [`JitterStats::current_jitter_ms`].
-//! * Prefer dropping late packets over adding delay — a missing packet is only
-//!   waited on for [`JitterBufferConfig::target_latency_ms`]; after that the
-//!   gap is declared lost and playback advances to the next available packet.
+//! * Use RTP timestamps to map every frame onto a stable wall-clock playout
+//!   deadline after one initial [`JitterBufferConfig::target_latency_ms`] delay.
+//! * Prefer concealment over growing delay — a missing packet produces one
+//!   [`PlayoutEvent`] at its scheduled deadline and playback keeps advancing.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -49,8 +50,8 @@ pub struct JitterBufferConfig {
     /// Hard ceiling on buffered audio depth. Oldest packets are dropped when
     /// the buffer would exceed this.
     pub max_latency_ms: u32,
-    /// Playout target. Doubles as the maximum time `pop()` will wait for a
-    /// missing (in-sequence) packet before declaring it lost and skipping it.
+    /// Initial playout depth. The first RTP timestamp is mapped to its arrival
+    /// time plus this delay; later frame deadlines follow the RTP timeline.
     pub target_latency_ms: u32,
     /// Hard ceiling on the number of buffered packets (safety valve against
     /// memory blowups during long stalls).
@@ -111,6 +112,35 @@ pub struct AudioPacket {
     pub payload: Vec<u8>,
 }
 
+/// One frame-slot decision made by the jitter buffer at its RTP deadline.
+///
+/// The next packet is cloned for FEC recovery but remains buffered for normal
+/// decoding at its own deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayoutEvent {
+    /// The expected packet arrived before its playout deadline.
+    Packet(AudioPacket),
+    /// The expected packet was absent and no immediately following packet can
+    /// provide in-band FEC. The decoder should perform packet-loss concealment.
+    Missing {
+        /// Sequence number of the lost packet.
+        sequence_number: u16,
+        /// Predicted RTP timestamp for the lost frame.
+        timestamp: u32,
+    },
+    /// The expected packet was absent, but the immediately following packet is
+    /// available and can be used to reconstruct it with Opus in-band FEC.
+    RecoveredWithNextPacket {
+        /// Sequence number of the lost packet being reconstructed.
+        sequence_number: u16,
+        /// Predicted RTP timestamp for the lost frame.
+        timestamp: u32,
+        /// Following packet containing the redundant FEC data. It remains in
+        /// the jitter buffer for normal decoding at its own deadline.
+        next_packet: AudioPacket,
+    },
+}
+
 /// Running counters and the adaptive jitter estimate.
 #[derive(Debug, Clone, Default)]
 pub struct JitterStats {
@@ -143,17 +173,23 @@ pub struct JitterBuffer {
     next_seq: i64,
     /// True once the first packet anchored `next_seq` to the stream.
     started: bool,
-    /// When the current sequence gap was first noticed by `pop()`.
-    gap_detected_at: Option<Instant>,
+    /// RTP timestamp expected for `next_seq` when that packet is absent.
+    next_timestamp: u32,
+    /// RTP timestamp mapped onto the first playout deadline.
+    anchor_timestamp: u32,
+    /// Wall-clock deadline corresponding to `anchor_timestamp`.
+    anchor_deadline: Option<Instant>,
+    /// True after the first frame slot has been emitted. Before that point an
+    /// earlier out-of-order packet may still move the stream anchor backwards.
+    playout_started: bool,
     /// RFC 3550 jitter estimate, in RTP timestamp units.
     jitter: f64,
     /// Arrival time of the previously pushed packet (for jitter deltas).
     last_arrival: Option<Instant>,
     /// RTP timestamp of the previously pushed packet.
     last_rtp_ts: Option<u32>,
-    /// Injectable time source. Defaults to [`Instant::now`]; used for the gap
-    /// grace window and inter-arrival jitter so timing can be mocked in tests
-    /// and benchmarks.
+    /// Injectable time source. Defaults to [`Instant::now`]; used for playout
+    /// deadlines and inter-arrival jitter so timing can be mocked in tests.
     now: Box<dyn Fn() -> Instant + Send + Sync>,
     // -- statistics --
     packets_in: u64,
@@ -190,7 +226,10 @@ impl JitterBuffer {
             packets: BTreeMap::new(),
             next_seq: 0,
             started: false,
-            gap_detected_at: None,
+            next_timestamp: 0,
+            anchor_timestamp: 0,
+            anchor_deadline: None,
+            playout_started: false,
             jitter: 0.0,
             last_arrival: None,
             last_rtp_ts: None,
@@ -209,19 +248,22 @@ impl JitterBuffer {
     ///   late and dropped (low-latency policy: never rewind the decoder).
     /// * Inserting may evict the oldest packets to respect the latency and
     ///   capacity limits.
-    pub fn push(&mut self, packet: AudioPacket) {
-        self.update_jitter(&packet);
+    pub fn push(&mut self, packet: AudioPacket) -> bool {
+        let now = (self.now)();
 
         if !self.started {
             // Anchor the extended sequence space on the first packet seen.
             self.next_seq = i64::from(packet.sequence_number);
+            self.next_timestamp = packet.timestamp;
+            self.anchor_timestamp = packet.timestamp;
+            self.anchor_deadline = Some(now + self.target_latency());
             self.started = true;
         }
 
         // Unfold the raw u16 into the extended sequence space so comparisons
         // are correct even across the u16 wraparound.
         let ext = extend_seq(packet.sequence_number, self.next_seq);
-        if ext < self.next_seq {
+        if ext < self.next_seq && self.playout_started {
             // Its playout slot is already gone — playing it now would add
             // delay or force a decoder rewind, so drop it.
             self.packets_late += 1;
@@ -230,7 +272,15 @@ impl JitterBuffer {
                 next = self.next_seq,
                 "jitter buffer: dropping late packet"
             );
-            return;
+            return false;
+        }
+        if ext < self.next_seq {
+            // Playout has not started, so this is an earlier out-of-order
+            // packet rather than a late packet. Keep the original wall-clock
+            // startup deadline but re-anchor its RTP timestamp and sequence.
+            self.next_seq = ext;
+            self.next_timestamp = packet.timestamp;
+            self.anchor_timestamp = packet.timestamp;
         }
         if self.packets.contains_key(&ext) {
             self.packets_dropped += 1;
@@ -238,7 +288,7 @@ impl JitterBuffer {
                 seq = packet.sequence_number,
                 "jitter buffer: duplicate packet"
             );
-            return;
+            return false;
         }
 
         trace!(
@@ -248,69 +298,89 @@ impl JitterBuffer {
         );
         self.packets.insert(ext, packet);
         self.packets_in += 1;
+        self.update_jitter(ext, now);
 
         self.enforce_limits();
+        self.packets.contains_key(&ext)
     }
 
-    /// Pop the next in-order packet for decoding.
+    /// Emit the next frame-slot decision once its RTP playout deadline is due.
     ///
-    /// Low-latency gap policy: if the expected packet is missing, wait at most
-    /// [`JitterBufferConfig::target_latency_ms`] for it to arrive. Once the
-    /// deadline passes, declare it lost, advance past the gap, and return the
-    /// next available packet instead of stalling playout.
-    pub fn pop(&mut self) -> Option<AudioPacket> {
+    /// This method never emits early. If the expected packet is missing but a
+    /// later packet proves that the RTP sequence has a gap, it emits exactly
+    /// one loss event and advances by one frame. Empty buffers produce no loss
+    /// events because RTP DTX can legitimately leave timestamp gaps without
+    /// consuming sequence numbers.
+    pub fn pop_event(&mut self) -> Option<PlayoutEvent> {
         if !self.started || self.packets.is_empty() {
             return None;
         }
 
-        // Fast path: the expected packet is buffered.
-        if let Some(pkt) = self.packets.remove(&self.next_seq) {
-            self.gap_detected_at = None;
-            self.next_seq += 1;
-            self.packets_out += 1;
-            trace!(seq = pkt.sequence_number, "jitter buffer: pop");
-            return Some(pkt);
-        }
-
-        // Gap: `next_seq` never arrived (yet).
-        let now = (self.now)();
-        let deadline = self.skip_deadline();
-        let expired = self
-            .gap_detected_at
-            .is_some_and(|t| now.duration_since(t) >= deadline);
-        if !expired {
-            // Start (or continue) the grace window for the straggler.
-            if self.gap_detected_at.is_none() {
-                debug!(
-                    missing = self.next_seq as u16,
-                    "jitter buffer: gap detected"
-                );
-                self.gap_detected_at = Some(now);
-            }
+        // An actual packet timestamp wins over the frame-size prediction. This
+        // preserves deliberate RTP timestamp gaps such as Opus DTX silence.
+        let scheduled_timestamp = self
+            .packets
+            .get(&self.next_seq)
+            .map_or(self.next_timestamp, |packet| packet.timestamp);
+        let deadline = self.deadline_for(scheduled_timestamp);
+        if (self.now)() < deadline {
             return None;
         }
 
-        // Deadline passed: the missing packet(s) are lost. Jump to the oldest
-        // packet we actually have — never wait longer than the target latency.
+        self.playout_started = true;
+
+        // Fast path: the expected packet was buffered before its deadline.
+        if let Some(pkt) = self.packets.remove(&self.next_seq) {
+            self.next_seq += 1;
+            self.next_timestamp = pkt.timestamp.wrapping_add(self.frame_ticks());
+            self.packets_out += 1;
+            trace!(seq = pkt.sequence_number, "jitter buffer: pop");
+            return Some(PlayoutEvent::Packet(pkt));
+        }
+
+        // A later buffered packet proves this sequence slot was lost. Advance
+        // one slot only so every missing frame gets one PLC/FEC opportunity.
+        let missing_seq = self.next_seq;
+        let missing_timestamp = self.next_timestamp;
         let next_key = *self.packets.keys().next().expect("non-empty checked above");
-        let skipped = (next_key - self.next_seq) as u64;
-        self.next_seq = next_key;
-        self.gap_detected_at = None;
-        self.packets_dropped += skipped;
+        debug_assert!(next_key > missing_seq);
+        self.next_seq += 1;
+        self.next_timestamp = missing_timestamp.wrapping_add(self.frame_ticks());
+        self.packets_dropped += 1;
         debug!(
-            skipped,
-            resumed_at = next_key as u16,
-            "jitter buffer: gap deadline passed, skipping lost packets"
+            missing = missing_seq as u16,
+            "jitter buffer: packet missing at playout deadline"
         );
 
-        // Hand the resumed packet straight to the decoder.
-        let pkt = self
-            .packets
-            .remove(&self.next_seq)
-            .expect("next_key was just taken from the map");
-        self.next_seq += 1;
-        self.packets_out += 1;
-        Some(pkt)
+        if next_key == missing_seq + 1 {
+            let next_packet = self
+                .packets
+                .get(&next_key)
+                .expect("next_key was just taken from the map")
+                .clone();
+            Some(PlayoutEvent::RecoveredWithNextPacket {
+                sequence_number: missing_seq as u16,
+                timestamp: missing_timestamp,
+                next_packet,
+            })
+        } else {
+            Some(PlayoutEvent::Missing {
+                sequence_number: missing_seq as u16,
+                timestamp: missing_timestamp,
+            })
+        }
+    }
+
+    /// Pop only real packets, preserving the original packet-oriented API.
+    ///
+    /// Loss events are consumed and returned as `None`; callers that decode
+    /// audio should use [`JitterBuffer::pop_event`] through [`AudioPipeline`](crate::audio::pipeline::AudioPipeline)
+    /// so FEC and packet-loss concealment are applied.
+    pub fn pop(&mut self) -> Option<AudioPacket> {
+        match self.pop_event()? {
+            PlayoutEvent::Packet(packet) => Some(packet),
+            PlayoutEvent::Missing { .. } | PlayoutEvent::RecoveredWithNextPacket { .. } => None,
+        }
     }
 
     /// Snapshot of counters and the adaptive jitter estimate.
@@ -324,12 +394,20 @@ impl JitterBuffer {
         }
     }
 
+    /// Whether packets are still waiting for their RTP playout deadlines.
+    pub fn has_pending(&self) -> bool {
+        !self.packets.is_empty()
+    }
+
     /// Reset all state for a new stream (keeps the configuration).
     pub fn clear(&mut self) {
         self.packets.clear();
         self.started = false;
         self.next_seq = 0;
-        self.gap_detected_at = None;
+        self.next_timestamp = 0;
+        self.anchor_timestamp = 0;
+        self.anchor_deadline = None;
+        self.playout_started = false;
         self.jitter = 0.0;
         self.last_arrival = None;
         self.last_rtp_ts = None;
@@ -340,9 +418,24 @@ impl JitterBuffer {
         debug!("jitter buffer: cleared for new stream");
     }
 
-    /// Grace window for a missing packet before it is declared lost.
-    fn skip_deadline(&self) -> Duration {
+    /// Initial wall-clock buffering delay.
+    fn target_latency(&self) -> Duration {
         Duration::from_millis(u64::from(self.config.target_latency_ms))
+    }
+
+    /// RTP timestamp ticks in one configured audio frame.
+    fn frame_ticks(&self) -> u32 {
+        ((u64::from(self.config.sample_rate) * u64::from(self.config.frame_size_ms)) / 1000) as u32
+    }
+
+    /// Stable wall-clock deadline for an RTP timestamp, including wraparound.
+    fn deadline_for(&self, timestamp: u32) -> Instant {
+        let delta_ticks = timestamp.wrapping_sub(self.anchor_timestamp);
+        let delta =
+            Duration::from_secs_f64(f64::from(delta_ticks) / f64::from(self.config.sample_rate));
+        self.anchor_deadline
+            .expect("started jitter buffer has a deadline anchor")
+            + delta
     }
 
     /// Enforce the packet-count and latency ceilings after an insert.
@@ -366,14 +459,33 @@ impl JitterBuffer {
     /// Remove the oldest buffered packet, counting it as dropped.
     fn evict_oldest(&mut self, reason: &str) {
         if let Some((key, pkt)) = self.packets.pop_first() {
-            self.packets_dropped += 1;
+            let skipped = if key >= self.next_seq {
+                (key - self.next_seq + 1) as u64
+            } else {
+                1
+            };
+            self.packets_dropped += skipped;
             debug!(
                 seq = pkt.sequence_number,
-                reason, "jitter buffer: evicting oldest packet"
+                skipped, reason, "jitter buffer: evicting oldest packet"
             );
-            // Never leave `next_seq` pointing below the oldest surviving
-            // packet — that would let a dead sequence slot block playout.
-            self.next_seq = self.next_seq.max(key);
+            if key >= self.next_seq {
+                // Capacity pressure intentionally skips old audio to bound
+                // latency. Advance every part of the playout cursor together
+                // so the evicted slot is not later counted or concealed again.
+                self.next_seq = key + 1;
+                self.next_timestamp = pkt.timestamp.wrapping_add(self.frame_ticks());
+
+                // Before startup, make the oldest survivor the new RTP anchor
+                // while retaining the original wall-clock startup deadline.
+                if !self.playout_started {
+                    if let Some((&next_key, next_packet)) = self.packets.first_key_value() {
+                        self.next_seq = next_key;
+                        self.next_timestamp = next_packet.timestamp;
+                        self.anchor_timestamp = next_packet.timestamp;
+                    }
+                }
+            }
         }
     }
 
@@ -385,8 +497,11 @@ impl JitterBuffer {
     /// RTP timestamp spacing. Both deltas are computed in RTP clock units
     /// (converted with wrapping arithmetic so u32 timestamp wraparound is
     /// handled), and the first packet of a stream only initializes state.
-    fn update_jitter(&mut self, packet: &AudioPacket) {
-        let now = (self.now)();
+    fn update_jitter(&mut self, ext: i64, now: Instant) {
+        let packet = self
+            .packets
+            .get(&ext)
+            .expect("accepted packet was inserted before jitter update");
         if let (Some(prev_arrival), Some(prev_ts)) = (self.last_arrival, self.last_rtp_ts) {
             // Arrival spacing expressed in RTP ticks (fractional ticks are
             // rounded; the /16 smoothing makes the error negligible).
@@ -442,16 +557,26 @@ mod tests {
         }
     }
 
+    fn pkt_at(seq: u16, timestamp: u32) -> AudioPacket {
+        AudioPacket {
+            sequence_number: seq,
+            timestamp,
+            payload: vec![seq as u8],
+        }
+    }
+
     /// A mock clock whose `Instant` advances only when told to, so the gap
     /// grace window can be driven deterministically without real time passing.
     #[derive(Clone)]
     struct MockClock {
+        base: Instant,
         t: std::sync::Arc<std::sync::Mutex<std::time::Duration>>,
     }
 
     impl MockClock {
         fn new() -> Self {
             Self {
+                base: Instant::now(),
                 t: std::sync::Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
             }
         }
@@ -459,10 +584,7 @@ mod tests {
             *self.t.lock().unwrap() += d;
         }
         fn now(&self) -> Instant {
-            // `Instant::now()` + a fixed offset derived from the mock duration.
-            // We only ever compare *relative* instants inside the buffer, so
-            // anchoring on a real base instant is safe.
-            Instant::now() + *self.t.lock().unwrap()
+            self.base + *self.t.lock().unwrap()
         }
     }
 
@@ -475,7 +597,8 @@ mod tests {
     /// (a) In-order packets pop in order.
     #[test]
     fn in_order_packets_pop_in_order() {
-        let mut jb = JitterBuffer::new(cfg(200, 40));
+        let clock = MockClock::new();
+        let mut jb = jb_with_clock(cfg(200, 0), &clock);
         for seq in 0..3u16 {
             jb.push(pkt(seq));
         }
@@ -483,6 +606,7 @@ mod tests {
             let out = jb.pop().expect("packet should be available");
             assert_eq!(out.sequence_number, seq);
             assert_eq!(out.payload, vec![seq as u8]);
+            clock.advance(Duration::from_millis(20));
         }
         assert_eq!(jb.stats().packets_out, 3);
     }
@@ -490,15 +614,17 @@ mod tests {
     /// (b) Out-of-order arrivals are reordered into sequence order.
     #[test]
     fn out_of_order_packets_are_reordered() {
-        let mut jb = JitterBuffer::new(cfg(200, 40));
+        let clock = MockClock::new();
+        let mut jb = jb_with_clock(cfg(200, 0), &clock);
         jb.push(pkt(0));
         jb.push(pkt(2));
         jb.push(pkt(1));
 
-        let seqs: Vec<u16> = (0..3)
-            .filter_map(|_| jb.pop())
-            .map(|p| p.sequence_number)
-            .collect();
+        let mut seqs = Vec::new();
+        for _ in 0..3 {
+            seqs.push(jb.pop().unwrap().sequence_number);
+            clock.advance(Duration::from_millis(20));
+        }
         assert_eq!(seqs, vec![0, 1, 2]);
         let stats = jb.stats();
         assert_eq!(stats.packets_in, 3);
@@ -511,19 +637,26 @@ mod tests {
     #[test]
     fn late_packets_beyond_max_latency_are_dropped() {
         let clock = MockClock::new();
-        let mut jb = jb_with_clock(cfg(200, 1), &clock); // 1 ms grace window
+        let mut jb = jb_with_clock(cfg(200, 0), &clock);
         jb.push(pkt(1));
         jb.push(pkt(3)); // 2 is missing
 
         assert_eq!(jb.pop().unwrap().sequence_number, 1);
-        assert!(jb.pop().is_none(), "should wait during grace window");
+        assert!(jb.pop_event().is_none(), "sequence 2 is not due yet");
 
-        // Let the gap deadline expire (advance mock clock past 1 ms), then pop.
-        clock.advance(Duration::from_millis(10));
-        assert_eq!(jb.pop().unwrap().sequence_number, 3);
+        clock.advance(Duration::from_millis(20));
+        assert!(matches!(
+            jb.pop_event(),
+            Some(PlayoutEvent::RecoveredWithNextPacket {
+                sequence_number: 2,
+                ..
+            })
+        ));
 
         // A very late arrival of 2 must be dropped, not replayed.
-        jb.push(pkt(2));
+        assert!(!jb.push(pkt(2)));
+        clock.advance(Duration::from_millis(20));
+        assert_eq!(jb.pop().unwrap().sequence_number, 3);
         let stats = jb.stats();
         assert_eq!(stats.packets_late, 1);
         assert_eq!(stats.packets_out, 2);
@@ -533,9 +666,9 @@ mod tests {
     /// (d) Duplicate packets are ignored.
     #[test]
     fn duplicates_are_ignored() {
-        let mut jb = JitterBuffer::new(cfg(200, 1));
-        jb.push(pkt(7));
-        jb.push(pkt(7)); // duplicate
+        let mut jb = JitterBuffer::new(cfg(200, 0));
+        assert!(jb.push(pkt(7)));
+        assert!(!jb.push(pkt(7))); // duplicate
 
         let stats = jb.stats();
         assert_eq!(stats.packets_in, 1, "only one copy accepted");
@@ -569,20 +702,48 @@ mod tests {
         assert!(stats.current_jitter_ms < 25.0);
     }
 
-    /// (f) Low-latency skip: a missing packet is played through once its
-    /// deadline passes instead of stalling the decoder.
+    /// (f) Startup waits for the target and a missing packet emits an FEC
+    /// event at its RTP deadline without growing the playout delay.
     #[test]
     fn low_latency_skip_when_gap_deadline_passes() {
-        let mut jb = JitterBuffer::new(cfg(200, 1)); // 1 ms grace window
+        let clock = MockClock::new();
+        let mut jb = jb_with_clock(cfg(200, 40), &clock);
         jb.push(pkt(0));
         jb.push(pkt(2)); // 1 is missing
 
-        assert_eq!(jb.pop().unwrap().sequence_number, 0);
-        assert!(jb.pop().is_none(), "grace window: not yet skipping");
+        assert!(jb.pop_event().is_none(), "startup target is not due");
+        clock.advance(Duration::from_millis(39));
+        assert!(jb.pop_event().is_none(), "must hold the full target depth");
+        clock.advance(Duration::from_millis(1));
+        assert!(matches!(
+            jb.pop_event(),
+            Some(PlayoutEvent::Packet(AudioPacket {
+                sequence_number: 0,
+                ..
+            }))
+        ));
 
-        std::thread::sleep(Duration::from_millis(10));
-        let out = jb.pop().expect("deadline passed, must skip and play");
-        assert_eq!(out.sequence_number, 2, "skipped the lost packet 1");
+        clock.advance(Duration::from_millis(20));
+        assert!(matches!(
+            jb.pop_event(),
+            Some(PlayoutEvent::RecoveredWithNextPacket {
+                sequence_number: 1,
+                next_packet: AudioPacket {
+                    sequence_number: 2,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        clock.advance(Duration::from_millis(20));
+        assert!(matches!(
+            jb.pop_event(),
+            Some(PlayoutEvent::Packet(AudioPacket {
+                sequence_number: 2,
+                ..
+            }))
+        ));
 
         let stats = jb.stats();
         assert_eq!(stats.packets_dropped, 1, "lost packet counted as dropped");
@@ -593,21 +754,25 @@ mod tests {
     /// (g) Sequence numbers are ordered correctly across the u16 wraparound.
     #[test]
     fn u16_wraparound_is_handled() {
-        let mut jb = JitterBuffer::new(cfg(500, 1));
+        let clock = MockClock::new();
+        let mut jb = jb_with_clock(cfg(500, 0), &clock);
+        let mut timestamp = u32::MAX - 1_500;
         for seq in [65_534u16, 65_535, 0, 1] {
-            jb.push(pkt(seq));
+            jb.push(pkt_at(seq, timestamp));
+            timestamp = timestamp.wrapping_add(960);
         }
-        let seqs: Vec<u16> = (0..4)
-            .filter_map(|_| jb.pop())
-            .map(|p| p.sequence_number)
-            .collect();
+        let mut seqs = Vec::new();
+        for _ in 0..4 {
+            seqs.push(jb.pop().unwrap().sequence_number);
+            clock.advance(Duration::from_millis(20));
+        }
         assert_eq!(seqs, vec![65_534, 65_535, 0, 1]);
     }
 
     /// (h) `clear()` resets stream state and statistics.
     #[test]
     fn clear_resets_for_new_stream() {
-        let mut jb = JitterBuffer::new(cfg(200, 1));
+        let mut jb = JitterBuffer::new(cfg(200, 0));
         jb.push(pkt(0));
         jb.push(pkt(1));
         assert!(jb.pop().is_some());
@@ -645,8 +810,70 @@ mod tests {
         ));
 
         // new() sanitizes instead of panicking: target clamped to max.
-        let mut jb = JitterBuffer::new(bad);
+        let clock = MockClock::new();
+        let mut jb = jb_with_clock(bad, &clock);
         jb.push(pkt(0));
+        assert!(jb.pop().is_none());
+        clock.advance(Duration::from_millis(60));
         assert!(jb.pop().is_some());
+    }
+
+    /// (j) RTP timestamp gaps delay contiguous sequence numbers without
+    /// synthesizing packet loss, which is required for sender-side DTX.
+    #[test]
+    fn rtp_timestamp_gap_controls_deadline() {
+        let clock = MockClock::new();
+        let mut jb = jb_with_clock(cfg(2_000, 0), &clock);
+        jb.push(pkt_at(10, 1_000));
+        jb.push(pkt_at(11, 49_000)); // one second later, sequence is contiguous
+
+        assert_eq!(jb.pop().unwrap().sequence_number, 10);
+        clock.advance(Duration::from_millis(999));
+        assert!(jb.pop().is_none());
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(jb.pop().unwrap().sequence_number, 11);
+        assert_eq!(jb.stats().packets_dropped, 0);
+    }
+
+    /// (k) Multiple consecutive losses emit PLC until the immediately
+    /// preceding missing frame can use the next packet's FEC data.
+    #[test]
+    fn consecutive_losses_emit_missing_then_fec() {
+        let clock = MockClock::new();
+        let mut jb = jb_with_clock(cfg(500, 0), &clock);
+        jb.push(pkt(0));
+        jb.push(pkt(3));
+
+        assert!(matches!(jb.pop_event(), Some(PlayoutEvent::Packet(_))));
+        clock.advance(Duration::from_millis(20));
+        assert!(matches!(
+            jb.pop_event(),
+            Some(PlayoutEvent::Missing {
+                sequence_number: 1,
+                ..
+            })
+        ));
+        clock.advance(Duration::from_millis(20));
+        assert!(matches!(
+            jb.pop_event(),
+            Some(PlayoutEvent::RecoveredWithNextPacket {
+                sequence_number: 2,
+                ..
+            })
+        ));
+    }
+
+    /// (l) Capacity eviction advances the complete playout cursor and does not
+    /// count or conceal the same discarded slot a second time.
+    #[test]
+    fn startup_eviction_reanchors_without_double_counting_loss() {
+        let mut jb = JitterBuffer::new(cfg(40, 0));
+        jb.push(pkt(1));
+        jb.push(pkt(2));
+        assert!(!jb.push(pkt(0))); // new oldest frame exceeds the ceiling
+
+        assert_eq!(jb.stats().packets_dropped, 1);
+        assert_eq!(jb.pop().unwrap().sequence_number, 1);
+        assert_eq!(jb.stats().packets_dropped, 1);
     }
 }
