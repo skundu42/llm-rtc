@@ -151,6 +151,10 @@ pub struct JitterBuffer {
     last_arrival: Option<Instant>,
     /// RTP timestamp of the previously pushed packet.
     last_rtp_ts: Option<u32>,
+    /// Injectable time source. Defaults to [`Instant::now`]; used for the gap
+    /// grace window and inter-arrival jitter so timing can be mocked in tests
+    /// and benchmarks.
+    now: Box<dyn Fn() -> Instant + Send + Sync>,
     // -- statistics --
     packets_in: u64,
     packets_out: u64,
@@ -162,6 +166,18 @@ impl JitterBuffer {
     /// Create a jitter buffer. Invalid config values are sanitized (see
     /// [`JitterBufferConfig::validate`] for strict checking).
     pub fn new(config: JitterBufferConfig) -> Self {
+        Self::with_clock(config, Box::new(Instant::now))
+    }
+
+    /// Create a jitter buffer with an injectable clock.
+    ///
+    /// `now` is called whenever the buffer needs the current time (gap grace
+    /// windows and inter-arrival jitter). Supply a mock clock for deterministic
+    /// tests and benchmarks.
+    pub fn with_clock(
+        config: JitterBufferConfig,
+        now: Box<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
         Self {
             config: JitterBufferConfig {
                 max_latency_ms: config.max_latency_ms,
@@ -178,6 +194,7 @@ impl JitterBuffer {
             jitter: 0.0,
             last_arrival: None,
             last_rtp_ts: None,
+            now,
             packets_in: 0,
             packets_out: 0,
             packets_dropped: 0,
@@ -256,7 +273,7 @@ impl JitterBuffer {
         }
 
         // Gap: `next_seq` never arrived (yet).
-        let now = Instant::now();
+        let now = (self.now)();
         let deadline = self.skip_deadline();
         let expired = self
             .gap_detected_at
@@ -369,7 +386,7 @@ impl JitterBuffer {
     /// (converted with wrapping arithmetic so u32 timestamp wraparound is
     /// handled), and the first packet of a stream only initializes state.
     fn update_jitter(&mut self, packet: &AudioPacket) {
-        let now = Instant::now();
+        let now = (self.now)();
         if let (Some(prev_arrival), Some(prev_ts)) = (self.last_arrival, self.last_rtp_ts) {
             // Arrival spacing expressed in RTP ticks (fractional ticks are
             // rounded; the /16 smoothing makes the error negligible).
@@ -425,6 +442,36 @@ mod tests {
         }
     }
 
+    /// A mock clock whose `Instant` advances only when told to, so the gap
+    /// grace window can be driven deterministically without real time passing.
+    #[derive(Clone)]
+    struct MockClock {
+        t: std::sync::Arc<std::sync::Mutex<std::time::Duration>>,
+    }
+
+    impl MockClock {
+        fn new() -> Self {
+            Self {
+                t: std::sync::Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
+            }
+        }
+        fn advance(&self, d: std::time::Duration) {
+            *self.t.lock().unwrap() += d;
+        }
+        fn now(&self) -> Instant {
+            // `Instant::now()` + a fixed offset derived from the mock duration.
+            // We only ever compare *relative* instants inside the buffer, so
+            // anchoring on a real base instant is safe.
+            Instant::now() + *self.t.lock().unwrap()
+        }
+    }
+
+    /// A jitter buffer driven by a [`MockClock`].
+    fn jb_with_clock(cfg: JitterBufferConfig, clock: &MockClock) -> JitterBuffer {
+        let c = clock.clone();
+        JitterBuffer::with_clock(cfg, Box::new(move || c.now()))
+    }
+
     /// (a) In-order packets pop in order.
     #[test]
     fn in_order_packets_pop_in_order() {
@@ -460,18 +507,19 @@ mod tests {
     }
 
     /// (c) Packets arriving after their slot was skipped are counted late and
-    /// never played.
+    /// never played. Uses a mock clock so the grace window is deterministic.
     #[test]
     fn late_packets_beyond_max_latency_are_dropped() {
-        let mut jb = JitterBuffer::new(cfg(200, 1)); // 1 ms grace window
+        let clock = MockClock::new();
+        let mut jb = jb_with_clock(cfg(200, 1), &clock); // 1 ms grace window
         jb.push(pkt(1));
         jb.push(pkt(3)); // 2 is missing
 
         assert_eq!(jb.pop().unwrap().sequence_number, 1);
         assert!(jb.pop().is_none(), "should wait during grace window");
 
-        // Let the gap deadline expire, then pop: 2 is declared lost, 3 plays.
-        std::thread::sleep(Duration::from_millis(10));
+        // Let the gap deadline expire (advance mock clock past 1 ms), then pop.
+        clock.advance(Duration::from_millis(10));
         assert_eq!(jb.pop().unwrap().sequence_number, 3);
 
         // A very late arrival of 2 must be dropped, not replayed.
