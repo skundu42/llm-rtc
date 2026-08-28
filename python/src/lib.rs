@@ -236,7 +236,9 @@ impl PyJitterBuffer {
     }
 
     fn pop(&mut self) -> Option<PyAudioPacket> {
-        self.inner.pop().map(|packet| PyAudioPacket { inner: packet })
+        self.inner
+            .pop()
+            .map(|packet| PyAudioPacket { inner: packet })
     }
 
     fn clear(&mut self) {
@@ -313,7 +315,11 @@ impl PyAudioProcessor {
         Ok(frame)
     }
 
-    fn process_with_reference(&mut self, near_end: Vec<i16>, far_end: Vec<i16>) -> PyResult<Vec<i16>> {
+    fn process_with_reference(
+        &mut self,
+        near_end: Vec<i16>,
+        far_end: Vec<i16>,
+    ) -> PyResult<Vec<i16>> {
         let mut frame = near_end;
         self.inner
             .process_with_reference(&mut frame, &far_end)

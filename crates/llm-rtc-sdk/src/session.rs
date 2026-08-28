@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use llm_rtc_core::audio::jitter::AudioPacket;
-use llm_rtc_core::audio::pipeline::{AudioPipeline, AudioPipelineConfig};
 use llm_rtc_core::audio::pipeline::PipelineError;
+use llm_rtc_core::audio::pipeline::{AudioPipeline, AudioPipelineConfig};
 use llm_rtc_core::peer::{PeerConfig, PeerConnectionHandle, RemoteTrack};
 use thiserror::Error;
 use tracing::debug;
@@ -121,9 +121,8 @@ impl VoiceLlmSession {
             .await
             .map_err(|e| SessionError::Peer(e.to_string()))?;
 
-        let frame_duration = Duration::from_secs_f64(
-            pipeline_config.codec.frame_size_ms as f64 / 1000.0,
-        );
+        let frame_duration =
+            Duration::from_secs_f64(pipeline_config.codec.frame_size_ms as f64 / 1000.0);
 
         let pipeline = AudioPipeline::new(pipeline_config)?;
 
@@ -342,10 +341,7 @@ mod tests {
             .create_offer()
             .await
             .expect("create_offer should succeed");
-        assert!(
-            !offer.sdp.is_empty(),
-            "offer SDP should not be empty"
-        );
+        assert!(!offer.sdp.is_empty(), "offer SDP should not be empty");
         session.close().await.expect("close should succeed");
     }
 

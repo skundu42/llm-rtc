@@ -237,11 +237,7 @@ impl AudioProcessor {
     /// buffered the same way). The far-end reference is consumed before the
     /// capture frames are processed so the AEC aligns against the most recent
     /// playback.
-    pub fn process_with_reference(
-        &mut self,
-        near_end: &mut [i16],
-        far_end: &[i16],
-    ) -> Result<()> {
+    pub fn process_with_reference(&mut self, near_end: &mut [i16], far_end: &[i16]) -> Result<()> {
         self.pending_render.extend_from_slice(far_end);
         while self.pending_render.len() >= FRAME_SAMPLES {
             let mut frame = [0.0f32; FRAME_SAMPLES];
@@ -305,10 +301,7 @@ impl AudioProcessor {
         ProcessorStats {
             has_voice: s.has_voice.unwrap_or(false),
             has_echo: s.has_echo.unwrap_or(false),
-            rms_dbfs: s
-                .rms_dbfs
-                .map(f64::from)
-                .unwrap_or(f64::NEG_INFINITY),
+            rms_dbfs: s.rms_dbfs.map(f64::from).unwrap_or(f64::NEG_INFINITY),
             speech_probability: s.speech_probability.unwrap_or(0.0) as f32,
         }
     }

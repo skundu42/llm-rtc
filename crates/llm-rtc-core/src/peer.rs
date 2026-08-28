@@ -16,8 +16,8 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::bundle_policy::RTCBundlePolicy;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
-use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp::header::Header;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
@@ -112,11 +112,10 @@ impl PeerConnectionHandle {
         &self,
         cb: impl Fn(RTCPeerConnectionState) + Send + Sync + 'static,
     ) {
-        self.pc
-            .on_peer_connection_state_change(Box::new(move |s| {
-                cb(s);
-                Box::pin(async {})
-            }));
+        self.pc.on_peer_connection_state_change(Box::new(move |s| {
+            cb(s);
+            Box::pin(async {})
+        }));
     }
 
     /// Register a callback invoked when a remote track arrives.

@@ -22,9 +22,7 @@ use tracing::{debug, trace};
 #[derive(Debug, Error)]
 pub enum JitterError {
     /// Target latency must never exceed the hard maximum latency.
-    #[error(
-        "target latency ({target_latency_ms} ms) exceeds max latency ({max_latency_ms} ms)"
-    )]
+    #[error("target latency ({target_latency_ms} ms) exceeds max latency ({max_latency_ms} ms)")]
     InvalidLatency {
         /// Requested target latency in milliseconds.
         target_latency_ms: u32,
@@ -219,11 +217,18 @@ impl JitterBuffer {
         }
         if self.packets.contains_key(&ext) {
             self.packets_dropped += 1;
-            debug!(seq = packet.sequence_number, "jitter buffer: duplicate packet");
+            debug!(
+                seq = packet.sequence_number,
+                "jitter buffer: duplicate packet"
+            );
             return;
         }
 
-        trace!(seq = packet.sequence_number, ts = packet.timestamp, "jitter buffer: push");
+        trace!(
+            seq = packet.sequence_number,
+            ts = packet.timestamp,
+            "jitter buffer: push"
+        );
         self.packets.insert(ext, packet);
         self.packets_in += 1;
 
@@ -259,7 +264,10 @@ impl JitterBuffer {
         if !expired {
             // Start (or continue) the grace window for the straggler.
             if self.gap_detected_at.is_none() {
-                debug!(missing = self.next_seq as u16, "jitter buffer: gap detected");
+                debug!(
+                    missing = self.next_seq as u16,
+                    "jitter buffer: gap detected"
+                );
                 self.gap_detected_at = Some(now);
             }
             return None;
@@ -440,7 +448,10 @@ mod tests {
         jb.push(pkt(2));
         jb.push(pkt(1));
 
-        let seqs: Vec<u16> = (0..3).filter_map(|_| jb.pop()).map(|p| p.sequence_number).collect();
+        let seqs: Vec<u16> = (0..3)
+            .filter_map(|_| jb.pop())
+            .map(|p| p.sequence_number)
+            .collect();
         assert_eq!(seqs, vec![0, 1, 2]);
         let stats = jb.stats();
         assert_eq!(stats.packets_in, 3);
@@ -501,7 +512,11 @@ mod tests {
             jb.push(pkt(seq));
         }
         let stats = jb.stats();
-        assert!(stats.current_jitter_ms > 0.0, "jitter should be > 0, got {}", stats.current_jitter_ms);
+        assert!(
+            stats.current_jitter_ms > 0.0,
+            "jitter should be > 0, got {}",
+            stats.current_jitter_ms
+        );
         // Converges toward |D| = 960 ticks = 20 ms; sanity-bound the estimate.
         assert!(stats.current_jitter_ms < 25.0);
     }
@@ -534,7 +549,10 @@ mod tests {
         for seq in [65_534u16, 65_535, 0, 1] {
             jb.push(pkt(seq));
         }
-        let seqs: Vec<u16> = (0..4).filter_map(|_| jb.pop()).map(|p| p.sequence_number).collect();
+        let seqs: Vec<u16> = (0..4)
+            .filter_map(|_| jb.pop())
+            .map(|p| p.sequence_number)
+            .collect();
         assert_eq!(seqs, vec![65_534, 65_535, 0, 1]);
     }
 
@@ -549,7 +567,12 @@ mod tests {
         jb.clear();
         let stats = jb.stats();
         assert_eq!(
-            (stats.packets_in, stats.packets_out, stats.packets_dropped, stats.packets_late),
+            (
+                stats.packets_in,
+                stats.packets_out,
+                stats.packets_dropped,
+                stats.packets_late
+            ),
             (0, 0, 0, 0)
         );
         assert_eq!(stats.current_jitter_ms, 0.0);
@@ -568,7 +591,10 @@ mod tests {
             max_latency_ms: 60,
             ..JitterBufferConfig::default()
         };
-        assert!(matches!(bad.validate(), Err(JitterError::InvalidLatency { .. })));
+        assert!(matches!(
+            bad.validate(),
+            Err(JitterError::InvalidLatency { .. })
+        ));
 
         // new() sanitizes instead of panicking: target clamped to max.
         let mut jb = JitterBuffer::new(bad);

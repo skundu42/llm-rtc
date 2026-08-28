@@ -20,12 +20,117 @@ tunes every layer for that goal:
 
 ## Crates
 
-- `llm-rtc-core` — WebRTC peer + audio pipeline engine
-- `llm-rtc-sdk` — high-level Rust SDK (voice LLM session API)
+- `llm-rtc-core` - WebRTC peer + audio pipeline engine
+- `llm-rtc-sdk` - high-level Rust SDK (voice LLM session API)
+
+## Quick Start
+
+Requirements: Rust (stable), and on Debian/Ubuntu the build deps:
+
+```sh
+sudo apt-get install -y cmake pkg-config libwebrtc-audio-processing-dev
+```
+
+Build and test the whole workspace:
+
+```sh
+cargo build --workspace
+cargo test --workspace
+```
+
+## Python SDK
+
+The Python bindings live in `python/` and are built with
+[PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs). Install maturin
+(`pip install maturin`) and build the wheel:
+
+```sh
+cd python && python3 -m maturin build --release
+pip install target/wheels/llm_rtc-*.whl
+```
+
+The wheel exposes Opus codecs, the audio processor (AEC/NS/AGC/VAD), the
+jitter buffer, and the full audio pipeline:
+
+```python
+from llm_rtc import (
+    OpusEncoder, OpusDecoder, AudioProcessor, JitterBuffer,
+    CodecConfig, ProcessorConfig, JitterBufferConfig, AudioPacket,
+)
+
+# Encode PCM (16-bit mono, 48 kHz) with voice-optimized Opus
+encoder = OpusEncoder(CodecConfig())
+frames = encoder.encode_frames(pcm_i16)  # one RTP packet per frame
+
+# Clean up the mic signal before sending it to the model
+processor = AudioProcessor(ProcessorConfig())
+cleaned = processor.process(mic_i16)
+
+# Buffer incoming packets and playout at a fixed low latency
+jitter = JitterBuffer(JitterBufferConfig())
+jitter.push(AudioPacket(sequence_number=seq, timestamp=ts, payload=payload))
+pkt = jitter.pop()  # None until the target latency is reached
+```
+
+## Architecture
+
+The workspace is split into two crates plus the Python bindings:
+
+- `crates/llm-rtc-core` - the engine: WebRTC peer (ICE/DTLS/SRTP), Opus
+  codec, WebRTC audio processing (AEC/NS/AGC/VAD), jitter buffer, and the
+  audio pipeline that wires them together
+- `crates/llm-rtc-sdk` - the high-level `VoiceLlmSession` API used by
+  applications (connect, stream audio in and out, observe state)
+- `python/` - PyO3 bindings over the core building blocks
+
+Audio flows through each side of a session in one direction of this pipeline:
+
+```
+mic -> process (AEC/NS/AGC) -> encode (Opus) -> network (SRTP)
+network (SRTP) -> jitter buffer -> decode (Opus) -> playout
+```
+
+The send path captures PCM, cleans it up, compresses it, and ships it over
+the secure transport. The receive path does the reverse, with the jitter
+buffer absorbing network timing variance before decode and playout. See
+[docs/architecture.md](docs/architecture.md) for the full picture.
+
+## Latency Tuning
+
+The main knobs, from codec to capture:
+
+- **`CodecConfig`** (`llm_rtc_core::audio::codec`)
+  - `bitrate`: 24 kbps default, clean speech with small packets
+  - `frame_size_ms`: 20 ms default; smaller frames cut algorithmic latency
+    at the cost of slightly worse compression
+  - `complexity`: CPU vs. quality trade-off
+  - DTX: stop transmitting during silence
+  - FEC: in-band forward error correction for lossy links
+- **`JitterBufferConfig`** (`llm_rtc_core::audio::jitter`)
+  - `target_latency_ms`: playout depth; lower is snappier, higher tolerates
+    more network jitter
+  - `max_latency_ms`: hard ceiling; oldest audio is dropped above it
+- **`ProcessorConfig`** (`llm_rtc_core::audio::processor`)
+  - `enable_aec`, `enable_ns`, `enable_agc`, `enable_vad`: WebRTC audio
+    processing modules; AEC needs a far-end reference
+
+All three default to voice-first, low-latency values.
+
+## Roadmap
+
+- STUN/TURN relay support for traversal through symmetric NATs
+- WebRTC data channels for control/metadata beside the audio
+- Adaptive bitrate driven by RTCP receiver reports
+- Echo cancellation tuning (delay estimation, far-end reference handling)
+- More SDKs (Node.js, WASM)
 
 ## Status
 
 Early development. See `crates/*/src` and `examples/`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

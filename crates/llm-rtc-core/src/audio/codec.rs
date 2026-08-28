@@ -234,7 +234,9 @@ impl OpusEncoder {
 
         // DTX suppresses packets during silence; the decoder fills in with
         // comfort noise. Essential for conversational turn-taking.
-        encoder.set_dtx(config.use_dtx).map_err(CodecError::Encode)?;
+        encoder
+            .set_dtx(config.use_dtx)
+            .map_err(CodecError::Encode)?;
 
         // In-band FEC embeds a loss-resilient copy of the prior frame. It
         // only engages when the encoder believes packets may be lost, so we
@@ -250,7 +252,9 @@ impl OpusEncoder {
 
         // Hint that the input is speech so libopus picks its voice-optimized
         // modes (e.g. CELT layer tuning) instead of relying on detection.
-        encoder.set_signal(Signal::Voice).map_err(CodecError::Encode)?;
+        encoder
+            .set_signal(Signal::Voice)
+            .map_err(CodecError::Encode)?;
 
         let samples_per_frame = config.samples_per_frame();
         tracing::debug!(
@@ -388,7 +392,11 @@ impl OpusDecoder {
     /// exactly what a jitter buffer wants on a late/missing packet.
     pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>> {
         let out = self.decode_impl(packet, false)?;
-        tracing::trace!(packet_bytes = packet.len(), samples = out.len(), "decoded opus packet");
+        tracing::trace!(
+            packet_bytes = packet.len(),
+            samples = out.len(),
+            "decoded opus packet"
+        );
         Ok(out)
     }
 
@@ -514,7 +522,10 @@ mod tests {
 
         // Non-silent: the reconstructed wave must retain real energy.
         let peak = decoded.iter().map(|s| s.abs()).max().unwrap_or(0);
-        assert!(peak > 1_000, "decoded sine wave appears silent (peak {peak})");
+        assert!(
+            peak > 1_000,
+            "decoded sine wave appears silent (peak {peak})"
+        );
     }
 
     #[test]
@@ -528,7 +539,11 @@ mod tests {
         let pcm = sine_frame(440.0, 48_000, frame * 2 + frame / 2, 8_000);
         let packets = encoder.encode_frames(&pcm).expect("encode_frames");
 
-        assert_eq!(packets.len(), 3, "partial tail frame must become its own packet");
+        assert_eq!(
+            packets.len(),
+            3,
+            "partial tail frame must become its own packet"
+        );
         assert!(packets.iter().all(|p| !p.is_empty()));
 
         // Decoding the stream yields 3 full frames of audio.
@@ -563,7 +578,9 @@ mod tests {
             ..CodecConfig::default()
         })
         .expect("dtx encoder");
-        let dtx_packets = dtx_encoder.encode_frames(&silence.repeat(20)).expect("encode");
+        let dtx_packets = dtx_encoder
+            .encode_frames(&silence.repeat(20))
+            .expect("encode");
         let dtx_min = dtx_packets.iter().map(|p| p.len()).min().unwrap();
 
         // No-DTX baseline: every silent frame still gets a real (if tiny)
@@ -574,7 +591,9 @@ mod tests {
             ..CodecConfig::default()
         })
         .expect("plain encoder");
-        let plain_packets = plain_encoder.encode_frames(&silence.repeat(20)).expect("encode");
+        let plain_packets = plain_encoder
+            .encode_frames(&silence.repeat(20))
+            .expect("encode");
         let plain_min = plain_packets.iter().map(|p| p.len()).min().unwrap();
 
         assert!(
@@ -597,8 +616,12 @@ mod tests {
 
         // Prime the encoder/decoder with a real frame, then "lose" the next
         // packet: an empty packet asks libopus for loss concealment.
-        let first = encoder.encode(&sine_frame(440.0, 48_000, frame, 8_000)).expect("encode");
-        let _next = encoder.encode(&sine_frame(440.0, 48_000, frame, 8_000)).expect("encode");
+        let first = encoder
+            .encode(&sine_frame(440.0, 48_000, frame, 8_000))
+            .expect("encode");
+        let _next = encoder
+            .encode(&sine_frame(440.0, 48_000, frame, 8_000))
+            .expect("encode");
 
         assert_eq!(decoder.decode(&first).expect("decode").len(), frame);
 

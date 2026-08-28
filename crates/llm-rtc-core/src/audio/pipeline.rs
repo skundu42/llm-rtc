@@ -40,7 +40,7 @@ pub type Result<T> = std::result::Result<T, PipelineError>;
 ///
 /// Groups the sub-configurations of every component the pipeline owns so a
 /// caller can construct the whole graph from one struct.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AudioPipelineConfig {
     /// Opus encoder/decoder settings (sample rate, bitrate, DTX, FEC, ...).
     pub codec: CodecConfig,
@@ -48,16 +48,6 @@ pub struct AudioPipelineConfig {
     pub jitter: JitterBufferConfig,
     /// AEC/NS/AGC/VAD settings for the microphone path.
     pub processor: ProcessorConfig,
-}
-
-impl Default for AudioPipelineConfig {
-    fn default() -> Self {
-        Self {
-            codec: CodecConfig::default(),
-            jitter: JitterBufferConfig::default(),
-            processor: ProcessorConfig::default(),
-        }
-    }
 }
 
 /// Full-duplex audio pipeline for one WebRTC audio session.
@@ -118,8 +108,7 @@ impl AudioPipeline {
         mic_pcm: &mut [i16],
         far_end: &[i16],
     ) -> Result<Vec<Vec<u8>>> {
-        self.processor
-            .process_with_reference(mic_pcm, far_end)?;
+        self.processor.process_with_reference(mic_pcm, far_end)?;
         self.encode_frame(mic_pcm)
     }
 
