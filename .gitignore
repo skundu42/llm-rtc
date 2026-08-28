@@ -1,0 +1,13 @@
+/target
+**/target
+Cargo.lock
+*.pyc
+__pycache__/
+*.so
+*.pyd
+/dist
+/build
+*.egg-info
+.venv/
+.idea/
+.vscode/

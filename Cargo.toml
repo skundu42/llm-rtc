@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/llm-rtc-core",
+    "crates/llm-rtc-sdk",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/skundu42/llm-rtc"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+webrtc = "0.12"
+opus = "0.3"
+webrtc-audio-processing = "0.4"
+bytes = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+thiserror = "1"
+futures = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+panic = "abort"

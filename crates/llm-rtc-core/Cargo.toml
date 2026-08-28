@@ -1,0 +1,21 @@
+[package]
+name = "llm-rtc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Low-latency WebRTC core engine for voice LLM applications"
+
+[dependencies]
+tokio.workspace = true
+webrtc.workspace = true
+opus.workspace = true
+webrtc-audio-processing.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "llm-rtc-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "High-level Rust SDK facade for llm-rtc"
+
+[dependencies]
+llm-rtc-core = { path = "../llm-rtc-core" }
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
