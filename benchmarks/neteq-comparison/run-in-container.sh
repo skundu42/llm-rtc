@@ -24,4 +24,13 @@ for profile in clean moderate severe; do
     "$profile" "$RESULTS_DIR/reference.pcm" "$profile_dir" 3
 done
 
+sweep_dir="$RESULTS_DIR/latency-sweep"
+mkdir -p "$sweep_dir"
+for max_latency_ms in 120 115 110 100 90 80; do
+  cap_dir="$sweep_dir/max-$max_latency_ms"
+  mkdir -p "$cap_dir"
+  /work/target/release/examples/neteq_trace_sender \
+    llm-only severe "$RESULTS_DIR/reference.pcm" "$cap_dir" "$max_latency_ms"
+done
+
 python3 /work/benchmarks/neteq-comparison/analyze.py "$RESULTS_DIR"

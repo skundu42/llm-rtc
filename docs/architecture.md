@@ -86,17 +86,20 @@ milliseconds of audio. For a voice conversation that growth is fatal to
 interactivity, so llm-rtc's buffer implements the opposite policy:
 
 - **Adaptive startup target.** `JitterBufferConfig::target_latency_ms` is the
-  minimum playout depth. Before playout begins, the target grows toward
-  `max_latency_ms` using four times the RFC 3550 inter-arrival jitter estimate.
-  Once playout starts, RTP deadlines stay fixed on the 20 ms clock.
+  minimum playout depth (5 ms by default). Before playout begins, the target
+  grows only enough to cover positive one-way transit-time spread observed
+  relative to the first packet, capped by `max_latency_ms`. Unlike multiplying
+  RFC 3550 jitter, this is not inflated by packet reordering. Once playout
+  starts, RTP deadlines stay fixed on the 10 ms clock.
 - **Bounded wait for loss.** If the next expected packet has not arrived
   within the target window, `pop()` stops waiting, declares it lost, and
   advances the sequence. The caller plays a gap (the decoder's FEC/PLC can
   fill in) instead of accumulating delay.
-- **Hard ceiling.** `max_latency_ms` caps actual/projected packet residence,
-  measured from arrival to its RTP-derived deadline; `max_packets` is a memory
-  safety valve. Discarded packets remain queued as missing playout slots, so
-  the decoder produces PLC instead of silently shortening the stream.
+- **Hard ceiling.** `max_latency_ms` caps adaptive startup delay and
+  `max_packets` is a memory safety valve. Early valid packets are retained:
+  their longer residence reflects lower network transit, not extra playout
+  latency. Capacity evictions remain queued as missing slots, so the decoder
+  produces PLC instead of silently shortening the stream.
 
 The trade-off is explicit: under sustained packet loss or severe jitter
 this policy produces audible gaps where a classical buffer would produce a
@@ -112,10 +115,10 @@ The codec defaults in `CodecConfig` are chosen for speech, not music:
 - **24 kbps mono.** Opus is perceptually tuned for speech at this rate.
   Higher bitrates add packet size (and therefore loss cost and serialize
   latency) with little audible benefit for voice.
-- **20 ms frames.** This is the classic WebRTC trade-off between
-  algorithmic latency and compression efficiency. Shorter frames reduce
-  the codec's own latency contribution but waste bits on per-frame
-  overhead; 20 ms keeps packets small without a big bitrate penalty.
+- **10 ms frames.** The default halves packetization delay relative to the
+  classic 20 ms WebRTC setting. Benchmarks retained 0% WER and improved
+  severe-trace PESQ while reducing playout and barge-in latency. Applications
+  that favor packet efficiency over latency can still select 20 ms.
 - **DTX (discontinuous transmission).** During silence no audio frames are
   sent. In a conversation one side is usually quiet, so this can cut
   average bandwidth roughly in half and, more importantly for latency,

@@ -101,15 +101,15 @@ The main knobs, from codec to capture:
 
 - **`CodecConfig`** (`llm_rtc_core::audio::codec`)
   - `bitrate`: 24 kbps default, clean speech with small packets
-  - `frame_size_ms`: 20 ms default; smaller frames cut algorithmic latency
-    at the cost of slightly worse compression
+  - `frame_size_ms`: 10 ms default for low algorithmic latency; 20 ms reduces
+    packet overhead when latency is less important
   - `complexity`: CPU vs. quality trade-off
   - DTX: stop transmitting during silence
   - FEC: in-band forward error correction for lossy links
 - **`JitterBufferConfig`** (`llm_rtc_core::audio::jitter`)
-  - `target_latency_ms`: minimum startup depth; lower is snappier
-  - `max_latency_ms`: adaptive target and packet-residence ceiling; packets
-    discarded above it still produce PLC at their RTP playout slots
+  - `target_latency_ms`: minimum startup depth (5 ms by default); lower is snappier
+  - `max_latency_ms`: hard ceiling for adaptive startup depth; valid packets
+    are not discarded merely because they arrived early
 - **`ProcessorConfig`** (`llm_rtc_core::audio::processor`)
   - `enable_aec`, `enable_ns`, `enable_agc`, `enable_vad`: WebRTC audio
     processing modules; AEC needs a far-end reference

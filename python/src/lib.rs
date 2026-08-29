@@ -31,7 +31,7 @@ impl PyCodecConfig {
         sample_rate = 48_000,
         channels = 1,
         bitrate = 24_000,
-        frame_size_ms = 20.0,
+        frame_size_ms = 10.0,
         use_dtx = true,
         use_fec = true,
         complexity = 0,
@@ -124,10 +124,10 @@ impl PyJitterBufferConfig {
     #[new]
     #[pyo3(signature = (
         max_latency_ms = 120,
-        target_latency_ms = 40,
+        target_latency_ms = 5,
         max_packets = 100,
         sample_rate = 48_000,
-        frame_size_ms = 20,
+        frame_size_ms = 10,
     ))]
     fn new(
         max_latency_ms: u32,

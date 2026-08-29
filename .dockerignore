@@ -3,3 +3,5 @@ target
 **/target
 benchmarks/neteq-comparison/results*
 **/.DS_Store
+**/__pycache__
+**/*.pyc

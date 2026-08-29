@@ -41,7 +41,7 @@ use tracing::debug;
 use webrtc_audio_processing as wap;
 
 /// Samples per engine frame: 10 ms @ 48 kHz, mono (interleaved, so 480 total).
-const FRAME_SAMPLES: usize = wap::NUM_SAMPLES_PER_FRAME as usize;
+pub(crate) const FRAME_SAMPLES: usize = wap::NUM_SAMPLES_PER_FRAME as usize;
 
 /// Fixed capture rate of the underlying engine (Hz).
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
@@ -158,12 +158,15 @@ pub struct AudioProcessor {
     init: wap::InitializationConfig,
     /// Runtime configuration, retained so `reset()` can re-apply it.
     config: ProcessorConfig,
+    /// Reusable mono frames in the engine's native non-interleaved layout.
+    capture_frame: Vec<Vec<f32>>,
+    render_frame: Vec<Vec<f32>>,
     /// Raw near-end (microphone) samples awaiting a complete 480-sample frame.
     pending_capture: Vec<i16>,
     /// Far-end (playback) samples awaiting a complete 480-sample frame.
     pending_render: Vec<i16>,
     /// Processed output samples that did not fit in the caller's buffer on
-    /// the previous call; delivered at the front of the next call.
+    /// the previous call; retained as reusable storage when empty.
     carry_out: Vec<i16>,
 }
 
@@ -209,6 +212,8 @@ impl AudioProcessor {
             processor,
             init,
             config,
+            capture_frame: vec![vec![0.0; FRAME_SAMPLES]],
+            render_frame: vec![vec![0.0; FRAME_SAMPLES]],
             pending_capture: Vec::new(),
             pending_render: Vec::new(),
             carry_out: Vec::new(),
@@ -223,6 +228,29 @@ impl AudioProcessor {
     /// processed and the partial data is retained for the next call — so
     /// callers may pass any chunk size (e.g. 160-sample Opus frames).
     pub fn process(&mut self, near_end: &mut [i16]) -> Result<()> {
+        if self.pending_capture.is_empty()
+            && self.carry_out.is_empty()
+            && near_end.len().is_multiple_of(FRAME_SAMPLES)
+        {
+            let Self {
+                processor,
+                capture_frame,
+                ..
+            } = self;
+            for chunk in near_end.chunks_exact_mut(FRAME_SAMPLES) {
+                for (dst, &src) in capture_frame[0].iter_mut().zip(chunk.iter()) {
+                    *dst = src as f32 / 32768.0;
+                }
+                processor
+                    .process_capture_frame_noninterleaved(capture_frame)
+                    .map_err(ProcessorError::Process)?;
+                for (dst, &src) in chunk.iter_mut().zip(capture_frame[0].iter()) {
+                    *dst = f32_to_i16(src);
+                }
+            }
+            return Ok(());
+        }
+
         self.pending_capture.extend_from_slice(near_end);
         let produced = self.drain_capture_frames()?;
         self.deliver(produced, near_end);
@@ -238,15 +266,7 @@ impl AudioProcessor {
     /// capture frames are processed so the AEC aligns against the most recent
     /// playback.
     pub fn process_with_reference(&mut self, near_end: &mut [i16], far_end: &[i16]) -> Result<()> {
-        self.pending_render.extend_from_slice(far_end);
-        while self.pending_render.len() >= FRAME_SAMPLES {
-            let mut frame = [0.0f32; FRAME_SAMPLES];
-            Self::fill_frame(&mut frame, &mut self.pending_render);
-            self.processor
-                .process_render_frame(&mut frame)
-                .map_err(ProcessorError::Process)?;
-        }
-
+        self.process_render(far_end)?;
         self.process(near_end)
     }
 
@@ -256,16 +276,29 @@ impl AudioProcessor {
     /// Use this when playback and capture arrive on separate paths (e.g. the
     /// render callback runs on a different task than the microphone reader);
     /// partial frames are buffered until 480 samples accumulate.
-    pub fn process_render(&mut self, far_end: &mut [i16]) -> Result<()> {
+    pub fn process_render(&mut self, far_end: &[i16]) -> Result<()> {
         self.pending_render.extend_from_slice(far_end);
-        while self.pending_render.len() >= FRAME_SAMPLES {
-            let mut frame = [0.0f32; FRAME_SAMPLES];
-            Self::fill_frame(&mut frame, &mut self.pending_render);
-            self.processor
-                .process_render_frame(&mut frame)
-                .map_err(ProcessorError::Process)?;
+        let complete_samples = self.pending_render.len() / FRAME_SAMPLES * FRAME_SAMPLES;
+        let Self {
+            processor,
+            render_frame,
+            pending_render,
+            ..
+        } = self;
+        let mut consumed = 0;
+        let mut failure = None;
+        for chunk in pending_render[..complete_samples].chunks_exact(FRAME_SAMPLES) {
+            for (dst, &src) in render_frame[0].iter_mut().zip(chunk) {
+                *dst = src as f32 / 32768.0;
+            }
+            consumed += FRAME_SAMPLES;
+            if let Err(error) = processor.process_render_frame_noninterleaved(render_frame) {
+                failure = Some(error);
+                break;
+            }
         }
-        Ok(())
+        pending_render.drain(..consumed);
+        failure.map_or(Ok(()), |error| Err(ProcessorError::Process(error)))
     }
 
     /// Drop and recreate the internal engine, clearing all buffered audio.
@@ -314,29 +347,42 @@ impl AudioProcessor {
             return Ok(Vec::new());
         }
 
-        let mut out = Vec::with_capacity(frames * FRAME_SAMPLES);
-        for _ in 0..frames {
-            let mut frame = [0.0f32; FRAME_SAMPLES];
-            Self::fill_frame(&mut frame, &mut self.pending_capture);
-            self.processor
-                .process_capture_frame(&mut frame)
-                .map_err(ProcessorError::Process)?;
-            out.extend(frame.iter().map(|&s| f32_to_i16(s)));
+        let mut out = if self.carry_out.is_empty() {
+            std::mem::take(&mut self.carry_out)
+        } else {
+            Vec::new()
+        };
+        out.reserve(frames * FRAME_SAMPLES);
+        let complete_samples = frames * FRAME_SAMPLES;
+        let Self {
+            processor,
+            capture_frame,
+            pending_capture,
+            ..
+        } = self;
+        let mut consumed = 0;
+        let mut failure = None;
+        for chunk in pending_capture[..complete_samples].chunks_exact(FRAME_SAMPLES) {
+            for (dst, &src) in capture_frame[0].iter_mut().zip(chunk) {
+                *dst = src as f32 / 32768.0;
+            }
+            consumed += FRAME_SAMPLES;
+            if let Err(error) = processor.process_capture_frame_noninterleaved(capture_frame) {
+                failure = Some(error);
+                break;
+            }
+            out.extend(capture_frame[0].iter().map(|&s| f32_to_i16(s)));
         }
-        Ok(out)
-    }
-
-    /// Move the front 480 buffered samples into `frame`, converting
-    /// `i16 -> f32` (full scale = 1.0) and consuming them from the buffer.
-    fn fill_frame(frame: &mut [f32; FRAME_SAMPLES], buffer: &mut Vec<i16>) {
-        for (dst, src) in frame.iter_mut().zip(buffer.drain(..FRAME_SAMPLES)) {
-            *dst = src as f32 / 32768.0;
-        }
+        pending_capture.drain(..consumed);
+        failure.map_or(Ok(out), |error| Err(ProcessorError::Process(error)))
     }
 
     /// Deliver processed samples into the caller's buffer, carrying any
     /// surplus over to the next call.
     fn deliver(&mut self, mut produced: Vec<i16>, near_end: &mut [i16]) {
+        if produced.is_empty() && self.carry_out.is_empty() {
+            return;
+        }
         if !self.carry_out.is_empty() {
             let mut carried = std::mem::take(&mut self.carry_out);
             carried.append(&mut produced);
@@ -345,9 +391,8 @@ impl AudioProcessor {
 
         let n = produced.len().min(near_end.len());
         near_end[..n].copy_from_slice(&produced[..n]);
-        if produced.len() > n {
-            self.carry_out = produced[n..].to_vec();
-        }
+        produced.drain(..n);
+        self.carry_out = produced;
     }
 }
 
@@ -423,6 +468,8 @@ mod tests {
             samples.iter().any(|&s| s != 0),
             "processed output must not be silent"
         );
+        assert!(proc.pending_capture.is_empty());
+        assert!(proc.carry_out.is_empty());
     }
 
     /// (c) Processing with a far-end reference (AEC path) runs without error.
@@ -431,10 +478,15 @@ mod tests {
         let mut proc = AudioProcessor::new(ProcessorConfig::default()).expect("processor");
 
         let mut near = sine(3 * FRAME_SAMPLES, 8_000);
-        let far = sine(3 * FRAME_SAMPLES, 4_000);
+        let far = sine(3 * FRAME_SAMPLES + 17, 4_000);
         proc.process_with_reference(&mut near, &far)
             .expect("process_with_reference");
         assert_eq!(near.len(), 3 * FRAME_SAMPLES);
+        assert_eq!(proc.pending_render.len(), 17);
+
+        proc.process_render(&[0; FRAME_SAMPLES - 17])
+            .expect("complete partial render frame");
+        assert!(proc.pending_render.is_empty());
     }
 
     /// (d) `reset()` recreates the engine and processing continues to work.
@@ -466,14 +518,19 @@ mod tests {
         let mut short = sine(100, 8_000);
         proc.process(&mut short).expect("partial chunk");
 
-        // Complete the frame: 100 + 380 = 480 samples, exactly one frame.
-        let mut rest = sine(380, 8_000);
+        // Complete two frames in one batch: 100 + 860 = 960 samples.
+        let mut rest = sine(2 * FRAME_SAMPLES - 100, 8_000);
         proc.process(&mut rest).expect("completing chunk");
 
-        // Call 1 delivered no output; call 2's buffer only fit 380 of the
-        // 480 processed samples, so 100 remain carried over for next time.
+        // Call 1 delivered no output; call 2's buffer only fit 860 of the
+        // 960 processed samples, so 100 remain carried over for next time.
         assert_eq!(proc.carry_out.len(), 100);
         // Buffer must be empty again — every buffered sample was consumed.
         assert_eq!(proc.pending_capture.len(), 0);
+
+        let mut next = sine(100, 8_000);
+        proc.process(&mut next).expect("consume carried output");
+        assert!(proc.carry_out.is_empty());
+        assert!(proc.carry_out.capacity() >= 2 * FRAME_SAMPLES);
     }
 }

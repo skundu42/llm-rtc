@@ -21,7 +21,9 @@ use crate::audio::codec::{CodecConfig, OpusDecoder, OpusEncoder};
 use crate::audio::jitter::{
     AudioPacket, JitterBuffer, JitterBufferConfig, JitterStats, PlayoutEvent,
 };
-use crate::audio::processor::{AudioProcessor, ProcessorConfig, ProcessorStats};
+use crate::audio::processor::{
+    AudioProcessor, ProcessorConfig, ProcessorStats, FRAME_SAMPLES as PROCESSOR_FRAME_SAMPLES,
+};
 
 /// Errors produced by the audio pipeline.
 #[derive(Debug, Error)]
@@ -66,6 +68,18 @@ pub struct AudioPipeline {
     jitter: JitterBuffer,
     /// AEC/NS/AGC/VAD applied to the outgoing microphone path.
     processor: AudioProcessor,
+    /// Incomplete microphone input awaiting one processor/codec-aligned block.
+    pending_outgoing: Vec<i16>,
+    /// Smallest block divisible by both the processor and codec frame sizes.
+    outgoing_block_samples: usize,
+}
+
+fn least_common_multiple(left: usize, right: usize) -> usize {
+    let (mut a, mut b) = (left, right);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    left / a * right
 }
 
 impl AudioPipeline {
@@ -79,6 +93,8 @@ impl AudioPipeline {
         let decoder = OpusDecoder::new(config.codec.clone())?;
         let jitter = JitterBuffer::new(config.jitter);
         let processor = AudioProcessor::new(config.processor)?;
+        let outgoing_block_samples =
+            least_common_multiple(encoder.samples_per_frame(), PROCESSOR_FRAME_SAMPLES);
 
         debug!("audio pipeline initialized");
 
@@ -87,6 +103,8 @@ impl AudioPipeline {
             decoder,
             jitter,
             processor,
+            pending_outgoing: Vec::new(),
+            outgoing_block_samples,
         })
     }
 
@@ -94,10 +112,51 @@ impl AudioPipeline {
     ///
     /// The PCM is first run through the audio processor (noise suppression,
     /// AGC, and AEC driven by the previously fed render signal), then encoded
-    /// into Opus packets. Returns the packets ready for the network.
+    /// into Opus packets. Incomplete chunks are retained until a full aligned
+    /// processing block is available. Returns the packets ready for the network.
     pub fn process_outgoing(&mut self, mic_pcm: &mut [i16]) -> Result<Vec<Vec<u8>>> {
-        self.processor.process(mic_pcm)?;
-        self.encode_frame(mic_pcm)
+        let mut packets = Vec::new();
+        self.process_outgoing_into(mic_pcm, &mut packets)?;
+        Ok(packets)
+    }
+
+    /// Process outgoing audio into caller-owned packet storage.
+    ///
+    /// This is equivalent to [`AudioPipeline::process_outgoing`], but reuses
+    /// the outer `Vec` allocation across real-time capture callbacks.
+    pub fn process_outgoing_into(
+        &mut self,
+        mic_pcm: &mut [i16],
+        packets: &mut Vec<Vec<u8>>,
+    ) -> Result<()> {
+        packets.clear();
+        if self.pending_outgoing.is_empty()
+            && mic_pcm.len().is_multiple_of(self.outgoing_block_samples)
+        {
+            self.processor.process(mic_pcm)?;
+            self.encoder.encode_frames_into(mic_pcm, packets)?;
+            return Ok(());
+        }
+
+        self.pending_outgoing.extend_from_slice(mic_pcm);
+        let complete_samples =
+            self.pending_outgoing.len() / self.outgoing_block_samples * self.outgoing_block_samples;
+        if complete_samples == 0 {
+            return Ok(());
+        }
+
+        let mut complete = if complete_samples == self.pending_outgoing.len() {
+            std::mem::take(&mut self.pending_outgoing)
+        } else {
+            self.pending_outgoing.drain(..complete_samples).collect()
+        };
+        self.processor.process(&mut complete)?;
+        self.encoder.encode_frames_into(&complete, packets)?;
+        if self.pending_outgoing.is_empty() {
+            complete.clear();
+            self.pending_outgoing = complete;
+        }
+        Ok(())
     }
 
     /// Process one outgoing microphone frame with an explicit echo reference.
@@ -110,8 +169,20 @@ impl AudioPipeline {
         mic_pcm: &mut [i16],
         far_end: &[i16],
     ) -> Result<Vec<Vec<u8>>> {
-        self.processor.process_with_reference(mic_pcm, far_end)?;
-        self.encode_frame(mic_pcm)
+        let mut packets = Vec::new();
+        self.process_outgoing_with_reference_into(mic_pcm, far_end, &mut packets)?;
+        Ok(packets)
+    }
+
+    /// Process referenced outgoing audio into caller-owned packet storage.
+    pub fn process_outgoing_with_reference_into(
+        &mut self,
+        mic_pcm: &mut [i16],
+        far_end: &[i16],
+        packets: &mut Vec<Vec<u8>>,
+    ) -> Result<()> {
+        self.processor.process_render(far_end)?;
+        self.process_outgoing_into(mic_pcm, packets)
     }
 
     /// Feed one playout frame to the AEC reference.
@@ -158,6 +229,11 @@ impl AudioPipeline {
         self.jitter.has_pending()
     }
 
+    /// Wall-clock deadline of the next buffered playout slot.
+    pub fn next_playout_deadline(&self) -> Option<std::time::Instant> {
+        self.jitter.next_deadline()
+    }
+
     /// Snapshot of the jitter buffer statistics.
     pub fn jitter_stats(&self) -> JitterStats {
         self.jitter.stats()
@@ -174,17 +250,9 @@ impl AudioPipeline {
     /// adaptive filters (useful when switching devices or reconnecting).
     pub fn reset(&mut self) {
         self.jitter.clear();
+        self.pending_outgoing.clear();
         self.processor.reset();
         debug!("audio pipeline reset");
-    }
-
-    /// Encode processed PCM into one or more Opus packets.
-    ///
-    /// The encoder is frame-oriented; it slices the input into whole frames
-    /// and returns one packet per frame.
-    fn encode_frame(&mut self, pcm: &[i16]) -> Result<Vec<Vec<u8>>> {
-        let packets = self.encoder.encode_frames(pcm)?;
-        Ok(packets)
     }
 }
 
@@ -194,8 +262,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    /// Samples per 20 ms frame at 48 kHz mono.
-    const FRAME_SAMPLES: usize = 960;
+    /// Samples per 10 ms frame at 48 kHz mono.
+    const FRAME_SAMPLES: usize = 480;
 
     /// Generate one frame of a 440 Hz sine wave at ~50% full scale.
     fn sine_frame(sample_rate: u32, offset: &mut usize) -> Vec<i16> {
@@ -212,11 +280,16 @@ mod tests {
         config: AudioPipelineConfig,
         now: Box<dyn Fn() -> Instant + Send + Sync>,
     ) -> AudioPipeline {
+        let encoder = OpusEncoder::new(config.codec.clone()).unwrap();
+        let outgoing_block_samples =
+            least_common_multiple(encoder.samples_per_frame(), PROCESSOR_FRAME_SAMPLES);
         AudioPipeline {
-            encoder: OpusEncoder::new(config.codec.clone()).unwrap(),
+            encoder,
             decoder: OpusDecoder::new(config.codec.clone()).unwrap(),
             jitter: JitterBuffer::with_clock(config.jitter, now),
             processor: AudioProcessor::new(config.processor).unwrap(),
+            pending_outgoing: Vec::new(),
+            outgoing_block_samples,
         }
     }
 
@@ -234,6 +307,75 @@ mod tests {
 
         assert!(!packets.is_empty(), "expected at least one packet");
         assert!(packets.iter().all(|p| !p.is_empty()));
+    }
+
+    #[test]
+    fn process_outgoing_into_reuses_packet_storage() {
+        let mut pipeline = AudioPipeline::new(AudioPipelineConfig::default()).unwrap();
+        let mut frame = sine_frame(48_000, &mut 0);
+        let mut packets = Vec::new();
+
+        pipeline
+            .process_outgoing_into(&mut frame, &mut packets)
+            .unwrap();
+        let capacity = packets.capacity();
+        pipeline
+            .process_outgoing_into(&mut frame, &mut packets)
+            .unwrap();
+
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets.capacity(), capacity);
+    }
+
+    #[test]
+    fn partial_outgoing_chunks_wait_for_a_complete_codec_block() {
+        const CHUNK_SAMPLES: usize = 240;
+
+        for frame_ms in [10.0, 20.0] {
+            let config = AudioPipelineConfig {
+                codec: CodecConfig {
+                    frame_size_ms: frame_ms,
+                    ..CodecConfig::default()
+                },
+                jitter: JitterBufferConfig {
+                    frame_size_ms: frame_ms as u32,
+                    ..JitterBufferConfig::default()
+                },
+                ..AudioPipelineConfig::default()
+            };
+            let expected_samples = (48_000.0 * frame_ms / 1_000.0) as usize;
+            let chunks = expected_samples / CHUNK_SAMPLES;
+            let mut pipeline = AudioPipeline::new(config.clone()).unwrap();
+            let mut packets = Vec::new();
+
+            for index in 0..chunks {
+                let mut chunk = vec![1_000; CHUNK_SAMPLES];
+                let produced = pipeline.process_outgoing(&mut chunk).unwrap();
+                if index + 1 < chunks {
+                    assert!(produced.is_empty());
+                } else {
+                    packets = produced;
+                }
+            }
+
+            assert_eq!(packets.len(), 1);
+            let mut decoder = OpusDecoder::new(config.codec).unwrap();
+            assert_eq!(decoder.decode(&packets[0]).unwrap().len(), expected_samples);
+        }
+
+        assert_eq!(least_common_multiple(720, PROCESSOR_FRAME_SAMPLES), 1_440);
+
+        let mut pipeline = AudioPipeline::new(AudioPipelineConfig::default()).unwrap();
+        let mut half_frame = vec![1_000; CHUNK_SAMPLES];
+        assert!(pipeline
+            .process_outgoing(&mut half_frame)
+            .unwrap()
+            .is_empty());
+        pipeline.reset();
+        assert!(pipeline
+            .process_outgoing(&mut half_frame)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -316,7 +458,7 @@ mod tests {
                 .unwrap()
                 .unwrap_or_else(|| panic!("slot {expected_slot} should be due"));
             assert_eq!(decoded.len(), FRAME_SAMPLES);
-            *elapsed.lock().unwrap() += Duration::from_millis(20);
+            *elapsed.lock().unwrap() += Duration::from_millis(10);
         }
 
         let stats = pipeline.jitter_stats();
@@ -330,13 +472,13 @@ mod tests {
     /// pressure must never silently shorten the stream.
     #[test]
     fn severe_jitter_trace_preserves_decoded_frame_continuity() {
-        const CONTENT_FRAMES: usize = 500;
-        const GUARD_FRAMES: usize = 5;
+        const CONTENT_FRAMES: usize = 1_000;
+        const GUARD_FRAMES: usize = 10;
 
         let config = AudioPipelineConfig {
             jitter: JitterBufferConfig {
-                target_latency_ms: 40,
-                max_latency_ms: 120,
+                target_latency_ms: 5,
+                max_latency_ms: 115,
                 ..JitterBufferConfig::default()
             },
             ..AudioPipelineConfig::default()
@@ -377,7 +519,7 @@ mod tests {
             let payload = encoder.encode(&frame).unwrap();
             if !dropped {
                 arrivals.push((
-                    frame_index as f64 * 20.0 + 50.0 + jitter_ms,
+                    frame_index as f64 * 10.0 + 50.0 + jitter_ms,
                     AudioPacket {
                         sequence_number: 10_000_u16.wrapping_add(frame_index as u16),
                         timestamp: 900_000_u32.wrapping_add((frame_index * FRAME_SAMPLES) as u32),
@@ -403,12 +545,18 @@ mod tests {
             if pipeline.pop_decoded().unwrap().is_some() {
                 decoded_frames += 1;
             }
-            tick_ms += 20.0;
+            // Model the SDK's 2x catch-up ceiling after an empty-buffer loss.
+            tick_ms += 5.0;
         }
 
         assert_eq!(
             decoded_frames, CONTENT_FRAMES,
             "severe trace silently lost a decoded playout slot"
+        );
+        assert!(pipeline.jitter_stats().packets_late < CONTENT_FRAMES as u64 / 10);
+        assert!(
+            tick_ms <= 10_100.0,
+            "severe trace accumulated excessive turn-ingress delay: {tick_ms} ms"
         );
     }
 }

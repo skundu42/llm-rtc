@@ -6,12 +6,22 @@ const { spawn } = require('child_process');
 const wrtc = require('@roamhq/wrtc');
 const { RTCAudioSink } = wrtc.nonstandard;
 
-const [profile, inputPath, outputDir, repetitionsText = '3'] = process.argv.slice(2);
+const [
+  profile,
+  inputPath,
+  outputDir,
+  repetitionsText = '3',
+  concurrencyText = '1',
+  mode = 'quality',
+] = process.argv.slice(2);
 if (!profile || !inputPath || !outputDir) {
-  console.error('usage: neteq_receiver.js <profile> <input.pcm> <output-dir> [repetitions]');
+  console.error(
+    'usage: neteq_receiver.js <profile> <input.pcm> <output-dir> [repetitions] [concurrency] [quality|load]',
+  );
   process.exit(2);
 }
 const repetitions = Number(repetitionsText);
+const concurrency = Number(concurrencyText);
 const senderPath = '/work/target/release/examples/neteq_trace_sender';
 
 function waitForIceGathering(pc) {
@@ -47,6 +57,23 @@ function median(values) {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
+function createStartGate(expected) {
+  let ready = 0;
+  let resolveReady;
+  let release;
+  const allReady = new Promise((resolve) => { resolveReady = resolve; });
+  const started = new Promise((resolve) => { release = resolve; });
+  return {
+    allReady,
+    release,
+    async arriveAndWait() {
+      ready += 1;
+      if (ready === expected) resolveReady();
+      await started;
+    },
+  };
+}
+
 function inboundAudioReport(reportSet) {
   for (const report of reportSet.values()) {
     if (report.type === 'inbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio')) {
@@ -56,8 +83,16 @@ function inboundAudioReport(reportSet) {
   return null;
 }
 
-async function runOnce(runIndex) {
-  const runDir = path.join(outputDir, `neteq-run-${runIndex + 1}`);
+async function runOnce(runIndex, options = {}) {
+  const {
+    startGate = null,
+    measureResources = true,
+    capturePcm = true,
+    sampleDetailedStats = true,
+    primaryOutput = runIndex === 0,
+    runPrefix = 'neteq-run',
+  } = options;
+  const runDir = path.join(outputDir, `${runPrefix}-${runIndex + 1}`);
   fs.mkdirSync(runDir, { recursive: true });
   const child = spawn(senderPath, ['neteq-sender', profile, inputPath, runDir], {
     stdio: ['pipe', 'pipe', 'inherit'],
@@ -67,8 +102,11 @@ async function runOnce(runIndex) {
   const pcmChunks = [];
   let sinkSamples = 0;
   let sinkCallbacks = 0;
+  const callbackTimeline = [];
   let callbackGaps = 0;
   let lastCallbackNs = null;
+  let measurementStartNs = null;
+  let firstCallbackElapsedMs = null;
   let measurementStarted = false;
   let cpuStart = null;
   let peakRss = process.memoryUsage().rss;
@@ -85,10 +123,20 @@ async function runOnce(runIndex) {
     sink.ondata = ({ samples }) => {
       if (!measurementStarted) return;
       const now = process.hrtime.bigint();
+      if (firstCallbackElapsedMs === null && measurementStartNs !== null) {
+        firstCallbackElapsedMs = Number(now - measurementStartNs) / 1e6;
+      }
       if (lastCallbackNs !== null && Number(now - lastCallbackNs) / 1e6 > 16) callbackGaps += 1;
       lastCallbackNs = now;
-      const copy = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
-      pcmChunks.push(Buffer.from(copy));
+      callbackTimeline.push({
+        sample_offset: sinkSamples,
+        sample_count: samples.length,
+        elapsed_ms: measurementStartNs === null ? 0 : Number(now - measurementStartNs) / 1e6,
+      });
+      if (capturePcm) {
+        const copy = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
+        pcmChunks.push(Buffer.from(copy));
+      }
       sinkSamples += samples.length;
       sinkCallbacks += 1;
     };
@@ -159,12 +207,18 @@ async function runOnce(runIndex) {
   child.stdin.write('ANSWER_READY\n');
   if (await nextLine() !== 'READY') throw new Error('sender did not connect');
 
+  if (startGate) await startGate.arriveAndWait();
   measurementStarted = true;
-  cpuStart = process.cpuUsage();
-  memoryTimer = setInterval(() => {
-    peakRss = Math.max(peakRss, process.memoryUsage().rss);
-  }, 10);
-  statsTimer = setInterval(() => { sampleStats().catch(() => {}); }, 10);
+  measurementStartNs = process.hrtime.bigint();
+  if (measureResources) {
+    cpuStart = process.cpuUsage();
+    memoryTimer = setInterval(() => {
+      peakRss = Math.max(peakRss, process.memoryUsage().rss);
+    }, 10);
+  }
+  if (sampleDetailedStats) {
+    statsTimer = setInterval(() => { sampleStats().catch(() => {}); }, 10);
+  }
   child.stdin.write('GO\n');
   if (await nextLine() !== 'SENT') throw new Error('sender did not finish the trace');
   await sampleStats();
@@ -174,9 +228,9 @@ async function runOnce(runIndex) {
   // post-stream run of NetEq-generated silence as media concealment.
   await new Promise((resolve) => setTimeout(resolve, 300));
   await sampleStats();
-  const cpu = process.cpuUsage(cpuStart);
-  clearInterval(memoryTimer);
-  clearInterval(statsTimer);
+  const cpu = measureResources ? process.cpuUsage(cpuStart) : { user: 0, system: 0 };
+  if (memoryTimer) clearInterval(memoryTimer);
+  if (statsTimer) clearInterval(statsTimer);
   measurementStarted = false;
   child.stdin.write('STOP\n');
   await finished;
@@ -184,8 +238,8 @@ async function runOnce(runIndex) {
   await pc.close();
 
   const capturedPcm = Buffer.concat(pcmChunks);
-  fs.writeFileSync(path.join(runDir, 'neteq.pcm'), capturedPcm);
-  if (runIndex === 0) fs.writeFileSync(path.join(outputDir, 'neteq.pcm'), capturedPcm);
+  if (capturePcm) fs.writeFileSync(path.join(runDir, 'neteq.pcm'), capturedPcm);
+  if (capturePcm && primaryOutput) fs.writeFileSync(path.join(outputDir, 'neteq.pcm'), capturedPcm);
   const totalSamples = Math.max(0,
     Number(mediaEndStats?.totalSamplesReceived || sinkSamples) -
     Number(mediaBaseline?.totalSamplesReceived || 0));
@@ -203,7 +257,9 @@ async function runOnce(runIndex) {
     profile,
     sink_samples: sinkSamples,
     sink_callbacks: sinkCallbacks,
+    first_callback_elapsed_ms: firstCallbackElapsedMs || 0,
     callback_gaps_over_16ms: callbackGaps,
+    callback_timeline: callbackTimeline,
     packets_received: Number(finalInbound?.packetsReceived || 0),
     packets_lost: Number(finalInbound?.packetsLost || 0),
     total_samples_received: totalSamples,
@@ -219,13 +275,77 @@ async function runOnce(runIndex) {
     p95_playout_delay_ms: weightedPercentile(delaySamples, 0.95),
     p99_playout_delay_ms: weightedPercentile(delaySamples, 0.99),
     cpu_ms_per_audio_second: (cpu.user + cpu.system) / 1000 / elapsedAudioSeconds,
-    peak_rss_mib: peakRss / 1024 / 1024,
+    peak_rss_mib: measureResources ? peakRss / 1024 / 1024 : 0,
     raw_inbound_stats: finalInbound,
   };
 }
 
 (async () => {
   fs.mkdirSync(outputDir, { recursive: true });
+  if (!Number.isInteger(repetitions) || repetitions < 1 ||
+      !Number.isInteger(concurrency) || concurrency < 1) {
+    throw new Error('repetitions and concurrency must be positive integers');
+  }
+  if (!['quality', 'load'].includes(mode)) throw new Error('mode must be quality or load');
+
+  if (mode === 'load') {
+    const batches = [];
+    for (let repetition = 0; repetition < repetitions; repetition += 1) {
+      const gate = createStartGate(concurrency);
+      const calls = Array.from({ length: concurrency }, (_, callIndex) => runOnce(
+        repetition * concurrency + callIndex,
+        {
+          startGate: gate,
+          measureResources: false,
+          capturePcm: false,
+          sampleDetailedStats: false,
+          primaryOutput: false,
+          runPrefix: `neteq-load-${repetition + 1}-call`,
+        },
+      ));
+      await gate.allReady;
+      let peakRss = process.memoryUsage().rss;
+      const memoryTimer = setInterval(() => {
+        peakRss = Math.max(peakRss, process.memoryUsage().rss);
+      }, 10);
+      const cpuStart = process.cpuUsage();
+      const wallStart = process.hrtime.bigint();
+      gate.release();
+      const callResults = await Promise.all(calls);
+      if (callResults.some((call) => call.sink_callbacks < 900 || call.packets_received < 400)) {
+        throw new Error('a concurrent NetEq call did not process the complete media trace');
+      }
+      const wallMs = Number(process.hrtime.bigint() - wallStart) / 1e6;
+      const cpu = process.cpuUsage(cpuStart);
+      clearInterval(memoryTimer);
+      batches.push({
+        cpu_ms_per_audio_second_per_call:
+          (cpu.user + cpu.system) / 1000 / (concurrency * 10),
+        batch_wall_ms: wallMs,
+        peak_rss_mib: peakRss / 1024 / 1024,
+        min_sink_callbacks: Math.min(...callResults.map((call) => call.sink_callbacks)),
+        min_packets_received: Math.min(...callResults.map((call) => call.packets_received)),
+      });
+    }
+    const loadSummary = {
+      engine: 'Chromium NetEq',
+      implementation: '@roamhq/wrtc 0.10.0 (libwebrtc)',
+      profile,
+      concurrent_calls: concurrency,
+      repetitions,
+      median_cpu_ms_per_audio_second_per_call:
+        median(batches.map((batch) => batch.cpu_ms_per_audio_second_per_call)),
+      median_batch_wall_ms: median(batches.map((batch) => batch.batch_wall_ms)),
+      peak_rss_mib: median(batches.map((batch) => batch.peak_rss_mib)),
+      batches,
+    };
+    fs.writeFileSync(
+      path.join(outputDir, 'neteq-load.json'),
+      JSON.stringify(loadSummary, null, 2),
+    );
+    process.exit(0);
+  }
+
   const runs = [];
   for (let i = 0; i < repetitions; i += 1) runs.push(await runOnce(i));
   const metric = (key) => median(runs.map((run) => run[key]));
@@ -234,6 +354,7 @@ async function runOnce(runIndex) {
     implementation: '@roamhq/wrtc 0.10.0 (libwebrtc)',
     profile,
     repetitions,
+    concurrent_calls: 1,
     continuity_pct: Math.max(0, 100 - metric('callback_gaps_over_16ms') / 1000 * 100),
     concealment_rate_pct: metric('concealment_rate_pct'),
     fec_packets_received: metric('fec_packets_received'),

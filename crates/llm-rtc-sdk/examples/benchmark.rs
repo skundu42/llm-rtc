@@ -13,11 +13,13 @@
 //! Run with: cargo run -p llm-rtc-sdk --example benchmark
 #![allow(clippy::cast_precision_loss)]
 
+use std::hint::black_box;
 use std::time::Instant;
 
 use llm_rtc_core::audio::codec::{CodecConfig, OpusDecoder, OpusEncoder};
-use llm_rtc_core::audio::jitter::{AudioPacket, JitterBuffer, JitterBufferConfig, JitterStats};
+use llm_rtc_core::audio::jitter::{AudioPacket, JitterBuffer, JitterBufferConfig, PlayoutEvent};
 use llm_rtc_core::audio::pipeline::{AudioPipeline, AudioPipelineConfig};
+use llm_rtc_core::audio::processor::{AudioProcessor, ProcessorConfig};
 
 const SAMPLE_RATE: u32 = 48_000;
 
@@ -117,6 +119,8 @@ fn bench_compression() {
     let min_pkt = packets.iter().map(|p| p.len()).min().unwrap();
     let max_pkt = packets.iter().map(|p| p.len()).max().unwrap();
     let avg_pkt = total_bytes as f64 / packets.len() as f64;
+    let avg_capacity =
+        packets.iter().map(Vec::capacity).sum::<usize>() as f64 / packets.len() as f64;
     println!("continuous speech (10 s):");
     println!(
         "  total encoded = {:.1} KB, achieved bitrate = {}",
@@ -126,9 +130,10 @@ fn bench_compression() {
     println!(
         "  packet size: min={min_pkt} B, avg={avg_pkt:.1} B, max={max_pkt} B (configured 24 kbps)"
     );
+    println!("  allocated packet capacity: avg={avg_capacity:.1} B");
 
     // DTX: 50% silence should suppress packets.
-    let silent = vec![0i16; spf * 250]; // 5 s of pure silence
+    let silent = vec![0i16; SAMPLE_RATE as usize * 5];
     let enc2 = OpusEncoder::new(CodecConfig {
         use_dtx: true,
         ..cfg.clone()
@@ -136,10 +141,8 @@ fn bench_compression() {
     .unwrap();
     let mut dtx_packets = 0usize;
     let mut dtx_bytes = 0usize;
-    for f in silent.chunks(spf) {
-        let mut frame = f.to_vec();
-        frame.resize(spf, 0);
-        let pkt = enc2.encode(&frame).unwrap();
+    for frame in silent.chunks_exact(spf) {
+        let pkt = enc2.encode(frame).unwrap();
         dtx_packets += 1;
         dtx_bytes += pkt.len();
     }
@@ -158,8 +161,10 @@ fn bench_latency() {
     // jitter buffer does not intentionally pace the tight benchmark loop.
     let mut cfg = AudioPipelineConfig::default();
     cfg.jitter.target_latency_ms = 0;
+    let frame_ms = cfg.codec.frame_size_ms;
+    let codec_spf =
+        (cfg.codec.sample_rate as f32 * frame_ms / 1_000.0) as usize * cfg.codec.channels as usize;
     let mut pipe = AudioPipeline::new(cfg).unwrap();
-    let codec_spf = 960; // 20 ms @ 48 kHz
 
     // Warm up the processor (it has internal state).
     let warm = vec![0i16; codec_spf];
@@ -169,7 +174,7 @@ fn bench_latency() {
     }
 
     // Measure single-frame latency: process -> encode -> jitter -> decode.
-    let frame = speech_like(0.02, SAMPLE_RATE); // exactly one 20 ms frame
+    let frame = speech_like(frame_ms / 1_000.0, SAMPLE_RATE);
     let n = 1000;
     let start = Instant::now();
     let mut decoded_frames = 0usize;
@@ -200,16 +205,67 @@ fn bench_latency() {
         n as f64 / wall
     );
     println!("  decoded {decoded_frames}/{n} frames (jitter/low-latency policy)");
+
+    // Capture APIs may deliver sub-frame chunks. They should be coalesced
+    // before processing/encoding rather than padded into extra packets.
+    let mut fragmented_cfg = AudioPipelineConfig::default();
+    fragmented_cfg.jitter.target_latency_ms = 0;
+    let mut fragmented_pipe = AudioPipeline::new(fragmented_cfg).unwrap();
+    let mut fragments: Vec<_> = frame
+        .chunks(codec_spf / 4)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let start = Instant::now();
+    let mut fragmented_packets = 0usize;
+    for _ in 0..n {
+        for fragment in &mut fragments {
+            fragmented_packets += fragmented_pipe.process_outgoing(fragment).unwrap().len();
+        }
+    }
+    let fragmented_wall = start.elapsed().as_secs_f64();
+    println!(
+        "  fragmented capture = {fragmented_packets} packets, {:.1} us/source frame",
+        fragmented_wall * 1_000_000.0 / n as f64
+    );
+
+    // File and telephony adapters may deliver audio in large batches even
+    // though the processor consumes fixed 10 ms frames internally.
+    let render_batch = speech_like(1.0, SAMPLE_RATE);
+    let render_frames = render_batch.len() / codec_spf;
+    let render_batches = 200;
+    let mut render_processor = AudioProcessor::new(ProcessorConfig::default()).unwrap();
+    render_processor.process_render(&render_batch).unwrap();
+    let start = Instant::now();
+    for _ in 0..render_batches {
+        render_processor.process_render(&render_batch).unwrap();
+    }
+    println!(
+        "  batched AEC render = {:.1} us/frame",
+        start.elapsed().as_secs_f64() * 1_000_000.0 / (render_frames * render_batches) as f64
+    );
+
+    let mut capture_batch = render_batch;
+    let mut capture_processor = AudioProcessor::new(ProcessorConfig::default()).unwrap();
+    capture_processor.process(&mut [0]).unwrap();
+    capture_processor.process(&mut capture_batch).unwrap();
+    let start = Instant::now();
+    for _ in 0..render_batches {
+        capture_processor.process(&mut capture_batch).unwrap();
+    }
+    println!(
+        "  partial batched capture = {:.1} us/frame",
+        start.elapsed().as_secs_f64() * 1_000_000.0 / (render_frames * render_batches) as f64
+    );
 }
 
 fn bench_jitter() {
     println!("\n=== D. JITTER BUFFER UNDER NETWORK STRESS ===");
     let cfg = JitterBufferConfig::default();
-    let spf = 960;
+    let frame_ms = f64::from(cfg.frame_size_ms);
+    let spf = (f64::from(cfg.sample_rate) * frame_ms / 1_000.0) as usize;
 
-    // Simulate a network: 500 frames, 30 ms mean jitter, 5% loss.
-    let n = 500;
-    let frame_ms = 20.0;
+    // Simulate ten seconds of audio with 30 ms jitter and 5% loss.
+    let n = (10_000.0 / frame_ms) as usize;
     let jitter_ms = 30.0;
     let loss_rate = 0.05;
     let mut rng_state = 0x12345678u32;
@@ -221,75 +277,87 @@ fn bench_jitter() {
         rng_state as f64 / u32::MAX as f64
     };
 
-    // Arrival timeline: base 20ms spacing + gaussian-ish jitter.
-    let mut arrival = vec![0.0f64; n];
-    let mut t = 0.0;
-    for slot in arrival.iter_mut() {
-        let j = (rng() - 0.5) * 2.0 * jitter_ms;
-        t += frame_ms + j;
-        *slot = t;
+    // Independent network jitter around each source timestamp. Sort by
+    // arrival because jitter can reorder packets.
+    let base_delay_ms = 50.0;
+    let mut arrival_by_frame = vec![None; n];
+    let mut arrivals = Vec::with_capacity(n);
+    for (frame, slot) in arrival_by_frame.iter_mut().enumerate() {
         if rng() < loss_rate {
-            *slot = f64::NEG_INFINITY; // lost
+            continue;
         }
+        let jitter = (rng() - 0.5) * 2.0 * jitter_ms;
+        let arrival = (frame as f64 * frame_ms + base_delay_ms + jitter).max(0.0);
+        *slot = Some(arrival);
+        arrivals.push((arrival, frame));
     }
+    arrivals.sort_by(|left, right| left.0.total_cmp(&right.0));
 
     // Mock clock: advance in lock-step with the playout timeline so the
     // jitter buffer's wall-clock grace windows align with the synthetic
     // network timing (deterministic, no real sleeping).
     let clock_t = std::sync::Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO));
+    let clock_base = std::time::Instant::now();
     let clock = {
         let t = clock_t.clone();
-        Box::new(move || std::time::Instant::now() + *t.lock().unwrap())
+        Box::new(move || clock_base + *t.lock().unwrap())
     };
     let mut jb = JitterBuffer::with_clock(cfg, clock);
 
-    // Feed packets in arrival order; pop on a 20ms playout clock.
+    // Feed packets in arrival order; pop on the configured playout clock.
     let mut playout_t = 0.0f64;
-    let mut emitted = 0u64;
+    let mut normal = 0u64;
+    let mut recovered = 0u64;
+    let mut missing = 0u64;
     let mut max_added_latency = 0.0f64;
-    let mut idx = 0usize;
+    let mut next_arrival = 0usize;
 
-    // Drain condition: all network frames delivered AND buffer drained.
-    let buffered =
-        |st: &JitterStats| st.packets_in > st.packets_out + st.packets_dropped + st.packets_late;
-
-    // Playout runs for a bounded window: n frames spacing + margin to drain.
-    let max_ticks = n + 50;
+    // Match the SDK's half-frame recovery polling and leave a one-second tail
+    // for the final buffered packet.
+    let poll_ms = (frame_ms / 2.0).max(1.0);
+    let max_ticks =
+        ((n as f64 * frame_ms + base_delay_ms + jitter_ms + 1_000.0) / poll_ms) as usize;
     let mut ticks = 0usize;
-    while (idx < n || buffered(&jb.stats())) && ticks < max_ticks {
+    while (next_arrival < arrivals.len() || jb.has_pending()) && ticks < max_ticks {
         // Deliver all packets whose arrival time has passed.
-        while idx < n && arrival[idx] <= playout_t {
-            if arrival[idx] == f64::NEG_INFINITY {
-                idx += 1; // lost on the network
-                continue;
-            }
+        while next_arrival < arrivals.len() && arrivals[next_arrival].0 <= playout_t {
+            let frame = arrivals[next_arrival].1;
             let ap = AudioPacket {
-                sequence_number: idx as u16,
-                timestamp: (idx as u32) * spf as u32,
+                sequence_number: frame as u16,
+                timestamp: (frame as u32) * spf as u32,
                 payload: vec![1, 2, 3], // placeholder payload
             };
             jb.push(ap);
-            idx += 1;
+            next_arrival += 1;
         }
         // Advance the mock clock to the current playout instant.
         *clock_t.lock().unwrap() = std::time::Duration::from_millis(playout_t as u64);
-        // Pop at playout clock.
-        while let Some(p) = jb.pop() {
-            let arrival_delay = playout_t - arrival[p.sequence_number as usize];
-            max_added_latency = max_added_latency.max(arrival_delay);
-            emitted += 1;
+        if let Some(event) = jb.pop_event() {
+            match event {
+                PlayoutEvent::Packet(packet) => {
+                    let arrival = arrival_by_frame[packet.sequence_number as usize]
+                        .expect("played packet has an arrival time");
+                    max_added_latency = max_added_latency.max(playout_t - arrival);
+                    normal += 1;
+                }
+                PlayoutEvent::RecoveredWithNextPacket { .. } => {
+                    recovered += 1;
+                }
+                PlayoutEvent::Missing { .. } => missing += 1,
+            }
         }
-        playout_t += frame_ms;
+        playout_t += poll_ms;
         ticks += 1;
     }
 
     let st = jb.stats();
+    let emitted = normal + recovered + missing;
     println!(
         "simulated network: {n} frames, {jitter_ms} ms jitter, {:.0}% loss",
         loss_rate * 100.0
     );
     println!(
-        "  emitted (played out) = {emitted} ({:.1}%)",
+        "  emitted slots = {emitted} ({:.1}%), normal={normal}, fec={recovered}, plc={missing}",
         emitted as f64 / n as f64 * 100.0
     );
     println!(
@@ -304,6 +372,7 @@ fn bench_jitter() {
 fn bench_throughput() {
     println!("\n=== E. RAW THROUGHPUT ===");
     let cfg = CodecConfig::default();
+    let frame_seconds = f64::from(cfg.frame_size_ms) / 1_000.0;
     let encoder = OpusEncoder::new(cfg.clone()).unwrap();
     let mut decoder = OpusDecoder::new(cfg).unwrap();
     let spf = encoder.samples_per_frame();
@@ -328,8 +397,51 @@ fn bench_throughput() {
         frames_per_sec, frames_per_sec
     );
     println!(
-        "  = {:.0}x realtime (one 20ms frame each)",
-        frames_per_sec * 0.020
+        "  = {:.0}x realtime ({:.0} ms frames)",
+        frames_per_sec * frame_seconds,
+        frame_seconds * 1_000.0,
+    );
+
+    let now = std::time::Instant::now();
+    let mut jitter = JitterBuffer::with_clock(
+        JitterBufferConfig {
+            target_latency_ms: 0,
+            ..JitterBufferConfig::default()
+        },
+        Box::new(move || now),
+    );
+    let packets = 1_000_000;
+    let start = Instant::now();
+    for sequence in 0..packets {
+        black_box(jitter.push(AudioPacket {
+            sequence_number: sequence as u16,
+            timestamp: 0,
+            payload: Vec::new(),
+        }));
+        black_box(jitter.pop());
+    }
+    println!(
+        "jitter push/pop: {:.1} ns/packet",
+        start.elapsed().as_secs_f64() * 1_000_000_000.0 / packets as f64
+    );
+
+    let batches = 100_000;
+    let batch_size = 8;
+    let start = Instant::now();
+    for _ in 0..batches {
+        jitter.clear();
+        for sequence in (0..batch_size).rev() {
+            black_box(jitter.push(AudioPacket {
+                sequence_number: sequence as u16,
+                timestamp: 0,
+                payload: Vec::new(),
+            }));
+        }
+        while black_box(jitter.pop()).is_some() {}
+    }
+    println!(
+        "jitter 8-packet reordered burst: {:.1} ns/packet",
+        start.elapsed().as_secs_f64() * 1_000_000_000.0 / (batches * batch_size) as f64
     );
 
     // Max decode rate.
@@ -348,14 +460,17 @@ fn bench_throughput() {
     println!(
         "decode: {:.0} packets/s ({:.0}x realtime)",
         fps,
-        fps * 0.020
+        fps * frame_seconds
     );
 }
 
 fn main() {
     println!("llm-rtc benchmark");
     println!("=================");
-    println!("sample rate: {SAMPLE_RATE} Hz, mono, 20 ms frames (default config)");
+    println!(
+        "sample rate: {SAMPLE_RATE} Hz, mono, {} ms frames (default config)",
+        CodecConfig::default().frame_size_ms
+    );
 
     bench_codec();
     bench_compression();

@@ -43,9 +43,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("VoiceLlmSession created (default config)");
 
     // Build the full-duplex audio pipeline with default settings:
-    // 48 kHz Opus, 20 ms frames, adaptive jitter buffer, AEC/NS/AGC.
+    // 48 kHz Opus, 10 ms frames, adaptive jitter buffer, AEC/NS/AGC.
+    let codec = CodecConfig::default();
+    let frame_ms = codec.frame_size_ms as u64;
+    let samples_per_frame = (SAMPLE_RATE as f32 * codec.frame_size_ms / 1_000.0) as u32;
     let config = AudioPipelineConfig {
-        codec: CodecConfig::default(),
+        codec,
         jitter: JitterBufferConfig::default(),
         processor: ProcessorConfig::default(),
     };
@@ -74,9 +77,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Simulate the network and the receiving side in a streaming fashion:
     // each encoded payload is wrapped in an AudioPacket (sequence number +
     // RTP timestamp) and pushed into the jitter buffer as it "arrives". A
-    // 20 ms media clock independently asks for the frame whose RTP deadline
-    // is due, matching the scheduling used by VoiceLlmSession.
-    let samples_per_frame = SAMPLE_RATE * 20 / 1000; // 20 ms frames
+    // The media clock independently asks for each frame at its RTP deadline,
+    // matching the scheduling used by VoiceLlmSession.
     let mut decoded_samples = 0usize;
     let mut decoded_frames = 0usize;
     for (seq, payload) in packets.iter().enumerate() {
@@ -87,7 +89,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         };
         pipeline.push_incoming(packet);
 
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(frame_ms)).await;
         if let Some(frame) = pipeline.pop_decoded()? {
             decoded_samples += frame.len();
             decoded_frames += 1;
@@ -97,7 +99,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // The initial target depth leaves a small tail after the final arrival.
     // Continue the media clock until every buffered RTP frame is played.
     while pipeline.has_pending_playout() {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(frame_ms)).await;
         if let Some(frame) = pipeline.pop_decoded()? {
             decoded_samples += frame.len();
             decoded_frames += 1;

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import csv
 import json
 import sys
 from pathlib import Path
@@ -117,6 +118,66 @@ def main(results_dir: Path) -> None:
                 fmt(row["p95_playout_delay_ms"]), fmt(row["p99_playout_delay_ms"]),
                 fmt(row["median_cpu_ms_per_audio_second"]), fmt(row["peak_rss_mib"]),
             ]))
+
+    sweep_rows = []
+    sweep_dir = results_dir / "latency-sweep"
+    for max_latency_ms in [120, 115, 110, 100, 90, 80]:
+        cap_dir = sweep_dir / f"max-{max_latency_ms}"
+        with (cap_dir / "llm-rtc.json").open() as handle:
+            row = json.load(handle)
+        row["audio_quality"] = quality(reference, cap_dir / "llm-rtc.pcm")
+        (cap_dir / "llm-rtc.json").write_text(json.dumps(row, indent=2) + "\n")
+        sweep_rows.append(row)
+
+    sweep_summary = {
+        "profile": "severe",
+        "trace": {
+            "base_delay_ms": 50,
+            "jitter_ms": 40,
+            "loss_rate_pct": 10,
+            "content_seconds": 10,
+        },
+        "llm_rtc": sweep_rows,
+        "neteq": summary["profiles"]["severe"]["neteq"],
+    }
+    (results_dir / "latency-sweep.json").write_text(
+        json.dumps(sweep_summary, indent=2) + "\n"
+    )
+
+    csv_fields = [
+        "max_latency_ms", "continuity_pct", "stoi", "si_sdr_db",
+        "fec_rate_pct", "plc_rate_pct", "late_drops",
+        "p95_playout_delay_ms", "p99_playout_delay_ms",
+        "median_cpu_ms_per_audio_second", "peak_rss_mib",
+    ]
+    with (results_dir / "latency-sweep.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=csv_fields)
+        writer.writeheader()
+        for row in sweep_rows:
+            writer.writerow({
+                "max_latency_ms": row["max_latency_ms"],
+                "continuity_pct": row["continuity_pct"],
+                "stoi": row["audio_quality"]["stoi"],
+                "si_sdr_db": row["audio_quality"]["si_sdr_db"],
+                "fec_rate_pct": row["fec_rate_pct"],
+                "plc_rate_pct": row["plc_rate_pct"],
+                "late_drops": row["late_drops"],
+                "p95_playout_delay_ms": row["p95_playout_delay_ms"],
+                "p99_playout_delay_ms": row["p99_playout_delay_ms"],
+                "median_cpu_ms_per_audio_second": row["median_cpu_ms_per_audio_second"],
+                "peak_rss_mib": row["peak_rss_mib"],
+            })
+
+    print("\nmax_latency_ms,continuity_pct,stoi,si_sdr_db,fec_pct,plc_pct,late_drops,p95_ms,p99_ms,cpu_ms_per_audio_s,peak_rss_mib")
+    for row in sweep_rows:
+        print(",".join([
+            str(row["max_latency_ms"]), fmt(row["continuity_pct"]),
+            fmt(row["audio_quality"]["stoi"], 3),
+            fmt(row["audio_quality"]["si_sdr_db"]), fmt(row["fec_rate_pct"]),
+            fmt(row["plc_rate_pct"]), str(row["late_drops"]),
+            fmt(row["p95_playout_delay_ms"]), fmt(row["p99_playout_delay_ms"]),
+            fmt(row["median_cpu_ms_per_audio_second"]), fmt(row["peak_rss_mib"]),
+        ]))
 
 
 if __name__ == "__main__":

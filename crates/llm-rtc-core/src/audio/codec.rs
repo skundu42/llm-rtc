@@ -88,8 +88,8 @@ pub struct CodecConfig {
     /// small packet sizes; the Opus "sweet spot" for VoIP is 16–32 kbps.
     pub bitrate: u32,
 
-    /// Frame duration in milliseconds. 20 ms is the classic WebRTC trade-off
-    /// between packet overhead and delay; use 10 ms for lower latency.
+    /// Frame duration in milliseconds. The 10 ms default prioritizes
+    /// conversational latency; use 20 ms to reduce packet overhead.
     pub frame_size_ms: f32,
 
     /// Enable Discontinuous Transmission: don't send packets during silence
@@ -113,7 +113,7 @@ impl Default for CodecConfig {
             sample_rate: 48_000,
             channels: 1,
             bitrate: 24_000,
-            frame_size_ms: 20.0,
+            frame_size_ms: 10.0,
             use_dtx: true,
             use_fec: true,
             complexity: 0,
@@ -171,7 +171,7 @@ impl CodecConfig {
 
     /// Number of PCM samples per frame, counting all channels interleaved.
     ///
-    /// For 20 ms @ 48 kHz mono this is 960.
+    /// For 10 ms @ 48 kHz mono this is 480.
     fn samples_per_frame(&self) -> usize {
         (self.frame_size_ms * self.sample_rate as f32 / 1000.0) as usize * self.channels as usize
     }
@@ -186,20 +186,26 @@ impl CodecConfig {
     }
 }
 
+#[derive(Debug)]
+struct EncoderState {
+    encoder: opus::Encoder,
+    output: [u8; MAX_PACKET_SIZE],
+}
+
 /// Opus encoder for real-time voice.
 ///
-/// Cheap to clone-safe use from multiple threads: the underlying libopus
-/// encoder sits behind a mutex so [`OpusEncoder::encode`] only needs `&self`
-/// (encoder state is mutated by libopus on every call).
+/// Safe to use from multiple threads: the underlying libopus encoder sits
+/// behind a mutex so [`OpusEncoder::encode`] only needs `&self` (encoder state
+/// is mutated by libopus on every call).
 #[derive(Debug)]
 pub struct OpusEncoder {
     /// Validated configuration this encoder was built from.
     config: CodecConfig,
     /// PCM samples per frame (all channels interleaved).
     samples_per_frame: usize,
-    /// The libopus encoder. `Mutex` gives interior mutability while keeping
-    /// `encode(&self)` ergonomic for callers in the audio pipeline.
-    encoder: Mutex<opus::Encoder>,
+    /// The libopus encoder and its reusable packet buffer. `Mutex` gives
+    /// interior mutability while keeping `encode(&self)` ergonomic.
+    state: Mutex<EncoderState>,
 }
 
 impl OpusEncoder {
@@ -272,7 +278,10 @@ impl OpusEncoder {
         Ok(Self {
             config,
             samples_per_frame,
-            encoder: Mutex::new(encoder),
+            state: Mutex::new(EncoderState {
+                encoder,
+                output: [0; MAX_PACKET_SIZE],
+            }),
         })
     }
 
@@ -300,14 +309,8 @@ impl OpusEncoder {
             });
         }
 
-        let mut encoder = self.encoder.lock().map_err(|_| CodecError::Poisoned)?;
-        // encode_vec allocates the output; MAX_PACKET_SIZE is the hard
-        // ceiling for any Opus packet so a single call can never truncate.
-        let packet = encoder
-            .encode_vec(pcm, MAX_PACKET_SIZE)
-            .map_err(CodecError::Encode)?;
-        tracing::trace!(bytes = packet.len(), "encoded opus frame");
-        Ok(packet)
+        let mut state = self.state.lock().map_err(|_| CodecError::Poisoned)?;
+        Self::encode_inner(&mut state, pcm)
     }
 
     /// Encode a PCM buffer by splitting it into frame-size chunks.
@@ -317,14 +320,32 @@ impl OpusEncoder {
     /// frame so the decoder can reconstruct continuous audio (silence at the
     /// tail is preferable to dropping the tail of an utterance).
     pub fn encode_frames(&mut self, pcm: &[i16]) -> Result<Vec<Vec<u8>>> {
+        let mut packets = Vec::new();
+        self.encode_frames_into(pcm, &mut packets)?;
+        Ok(packets)
+    }
+
+    /// Encode frames into caller-owned storage so hot-path users can retain
+    /// the outer allocation between calls.
+    pub(crate) fn encode_frames_into(
+        &mut self,
+        pcm: &[i16],
+        packets: &mut Vec<Vec<u8>>,
+    ) -> Result<()> {
         let frame = self.samples_per_frame;
-        let mut packets = Vec::with_capacity(pcm.len() / frame.max(1) + 1);
+        packets.clear();
+        packets.reserve(pcm.len().div_ceil(frame));
+        let state = self.state.get_mut().map_err(|_| CodecError::Poisoned)?;
 
         for chunk in pcm.chunks(frame) {
-            // The final chunk may be short; pad with silence to a full frame.
-            let mut frame_pcm = chunk.to_vec();
-            frame_pcm.resize(frame, 0);
-            packets.push(self.encode(&frame_pcm)?);
+            if chunk.len() == frame {
+                packets.push(Self::encode_inner(state, chunk)?);
+            } else {
+                // The final chunk may be short; pad with silence to a full frame.
+                let mut padded = vec![0; frame];
+                padded[..chunk.len()].copy_from_slice(chunk);
+                packets.push(Self::encode_inner(state, &padded)?);
+            }
         }
 
         tracing::trace!(
@@ -332,7 +353,17 @@ impl OpusEncoder {
             input_samples = pcm.len(),
             "encoded pcm buffer into opus frames"
         );
-        Ok(packets)
+        Ok(())
+    }
+
+    fn encode_inner(state: &mut EncoderState, pcm: &[i16]) -> Result<Vec<u8>> {
+        let bytes = state
+            .encoder
+            .encode(pcm, &mut state.output)
+            .map_err(CodecError::Encode)?;
+        let packet = state.output[..bytes].to_vec();
+        tracing::trace!(bytes, "encoded opus frame");
+        Ok(packet)
     }
 }
 
@@ -464,7 +495,7 @@ mod tests {
         assert_eq!(cfg.sample_rate, 48_000);
         assert_eq!(cfg.channels, 1);
         assert_eq!(cfg.bitrate, 24_000);
-        assert_eq!(cfg.frame_size_ms, 20.0);
+        assert_eq!(cfg.frame_size_ms, 10.0);
         assert!(cfg.use_dtx);
         assert!(cfg.use_fec);
         assert_eq!(cfg.complexity, 0);
@@ -500,7 +531,7 @@ mod tests {
     #[test]
     fn encode_then_decode_sine_roundtrip() {
         let config = CodecConfig::default();
-        let samples_per_frame = config.samples_per_frame(); // 960 @ 48 kHz mono
+        let samples_per_frame = config.samples_per_frame(); // 480 @ 48 kHz mono
 
         let encoder = OpusEncoder::new(config.clone()).expect("encoder");
         let mut decoder = OpusDecoder::new(config).expect("decoder");
@@ -510,7 +541,7 @@ mod tests {
 
         let packet = encoder.encode(&pcm).expect("encode");
         assert!(!packet.is_empty(), "encoded packet must not be empty");
-        // 24 kbps over 20 ms should stay far below the 1275-byte ceiling.
+        // 24 kbps over 10 ms should stay far below the 1275-byte ceiling.
         assert!(packet.len() <= MAX_PACKET_SIZE);
 
         let decoded = decoder.decode(&packet).expect("decode");
@@ -531,7 +562,7 @@ mod tests {
     #[test]
     fn encode_frames_splits_into_frame_chunks() {
         let config = CodecConfig::default();
-        let frame = config.samples_per_frame(); // 960
+        let frame = config.samples_per_frame(); // 480
 
         let mut encoder = OpusEncoder::new(config).expect("encoder");
 

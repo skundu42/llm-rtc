@@ -27,9 +27,8 @@ use llm_rtc_core::audio::pipeline::PipelineError;
 use llm_rtc_core::audio::pipeline::{AudioPipeline, AudioPipelineConfig};
 use llm_rtc_core::peer::{PeerConfig, PeerConnectionHandle, RemoteTrack};
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
 use tracing::debug;
 use webrtc::media::Sample;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -96,32 +95,58 @@ pub struct VoiceLlmSession {
     local_track: Arc<TrackLocalStaticSample>,
     /// Shared audio pipeline (AEC/NS/AGC + Opus + jitter buffer).
     pipeline: Arc<Mutex<AudioPipeline>>,
+    /// Reusable outer storage for encoded packets.
+    outgoing_packets: Vec<Vec<u8>>,
     /// Duration of one Opus frame (used for RTP packetization timing).
     frame_duration: Duration,
 }
 
 type RemoteAudioCallback = Arc<dyn Fn(Vec<i16>) + Send + Sync + 'static>;
 
-/// Run playout on a stable media clock instead of coupling it to RTP arrival.
-/// RTP timestamps inside the jitter buffer decide whether a frame is due on
-/// each tick. Once the receiver exits, the task keeps ticking until every
-/// buffered tail packet has been decoded.
+/// Run playout on RTP deadlines instead of coupling it to packet arrival.
+/// Once the receiver exits, the task keeps sleeping and decoding until every
+/// buffered tail packet has been played.
 fn spawn_playout_task(
     pipeline: Arc<Mutex<AudioPipeline>>,
     cb: RemoteAudioCallback,
     frame_duration: Duration,
-    receiver_done: watch::Receiver<bool>,
+    mut receiver_done: watch::Receiver<bool>,
+    packet_ready: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(frame_duration);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        // `interval` ticks immediately once. Consume that tick so subsequent
-        // polls stay on the configured media-frame cadence.
-        ticker.tick().await;
+        let recovery_interval = frame_duration.div_f64(2.0).max(Duration::from_millis(1));
+        let mut next_decode_at = tokio::time::Instant::now();
 
         loop {
-            ticker.tick().await;
+            let (deadline, pending) = {
+                let pipeline = pipeline.lock().expect("pipeline mutex poisoned");
+                (
+                    pipeline.next_playout_deadline(),
+                    pipeline.has_pending_playout(),
+                )
+            };
+
+            if *receiver_done.borrow() && !pending {
+                break;
+            }
+
+            let Some(deadline) = deadline else {
+                tokio::select! {
+                    _ = packet_ready.notified() => {}
+                    changed = receiver_done.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            };
+
+            let wake_at = tokio::time::Instant::from_std(deadline).max(next_decode_at);
+            tokio::select! {
+                _ = tokio::time::sleep_until(wake_at) => {}
+                _ = packet_ready.notified() => continue,
+            }
 
             let (decoded, pending) = {
                 let mut pipeline = pipeline.lock().expect("pipeline mutex poisoned");
@@ -137,6 +162,9 @@ fn spawn_playout_task(
 
             if let Some(pcm) = decoded {
                 cb(pcm);
+                // A delayed task may catch up, but never emits faster than 2x
+                // the media rate and therefore does not burst stale audio.
+                next_decode_at = tokio::time::Instant::now() + recovery_interval;
             }
 
             if *receiver_done.borrow() && !pending {
@@ -182,6 +210,7 @@ impl VoiceLlmSession {
             peer,
             local_track,
             pipeline: Arc::new(Mutex::new(pipeline)),
+            outgoing_packets: Vec::new(),
             frame_duration,
         })
     }
@@ -202,7 +231,7 @@ impl VoiceLlmSession {
     ///
     /// 1. reads RTP packets off the remote track,
     /// 2. pushes them into the jitter buffer,
-    /// 3. ticks independently at the configured media-frame cadence,
+    /// 3. sleeps independently until each RTP playout deadline,
     /// 4. pops RTP-deadline events and applies normal decode, FEC, or PLC,
     /// 5. invokes `cb` with the decoded PCM samples.
     ///
@@ -218,8 +247,15 @@ impl VoiceLlmSession {
             let pipeline = Arc::clone(&pipeline);
             let cb = Arc::clone(&cb);
             let (receiver_done_tx, receiver_done_rx) = watch::channel(false);
+            let packet_ready = Arc::new(Notify::new());
 
-            spawn_playout_task(Arc::clone(&pipeline), cb, frame_duration, receiver_done_rx);
+            spawn_playout_task(
+                Arc::clone(&pipeline),
+                cb,
+                frame_duration,
+                receiver_done_rx,
+                Arc::clone(&packet_ready),
+            );
 
             tokio::spawn(async move {
                 // Max UDP payload size; RTP payloads are always smaller.
@@ -242,11 +278,16 @@ impl VoiceLlmSession {
 
                     // Packet arrival only feeds the jitter buffer. A separate
                     // media-clock task performs deadline-driven playout.
-                    {
+                    let wake_playout = {
                         let mut pipeline = pipeline.lock().expect("pipeline mutex poisoned");
+                        let previous_deadline = pipeline.next_playout_deadline();
                         if !pipeline.push_incoming(packet) {
                             debug!("jitter buffer dropped late/duplicate packet");
                         }
+                        pipeline.next_playout_deadline() != previous_deadline
+                    };
+                    if wake_playout {
+                        packet_ready.notify_one();
                     }
                 }
 
@@ -261,11 +302,18 @@ impl VoiceLlmSession {
     /// The frame is processed by the audio pipeline (AEC/NS/AGC) and Opus
     /// encoded; the resulting packets are written to the local track.
     pub async fn send_audio(&mut self, mic_pcm: &mut [i16]) -> Result<()> {
-        let packets = {
+        let mut packets = std::mem::take(&mut self.outgoing_packets);
+        let encoded = {
             let mut pipeline = self.pipeline.lock().expect("pipeline mutex poisoned");
-            pipeline.process_outgoing(mic_pcm)?
+            pipeline.process_outgoing_into(mic_pcm, &mut packets)
         };
-        self.write_packets(packets).await
+        if let Err(error) = encoded {
+            self.outgoing_packets = packets;
+            return Err(error.into());
+        }
+        let result = self.write_packets(&mut packets).await;
+        self.outgoing_packets = packets;
+        result
     }
 
     /// Send one frame of microphone audio with an explicit far-end (speaker)
@@ -278,16 +326,23 @@ impl VoiceLlmSession {
         mic_pcm: &mut [i16],
         far_end: &[i16],
     ) -> Result<()> {
-        let packets = {
+        let mut packets = std::mem::take(&mut self.outgoing_packets);
+        let encoded = {
             let mut pipeline = self.pipeline.lock().expect("pipeline mutex poisoned");
-            pipeline.process_outgoing_with_reference(mic_pcm, far_end)?
+            pipeline.process_outgoing_with_reference_into(mic_pcm, far_end, &mut packets)
         };
-        self.write_packets(packets).await
+        if let Err(error) = encoded {
+            self.outgoing_packets = packets;
+            return Err(error.into());
+        }
+        let result = self.write_packets(&mut packets).await;
+        self.outgoing_packets = packets;
+        result
     }
 
     /// Write encoded Opus packets to the local WebRTC track.
-    async fn write_packets(&self, packets: Vec<Vec<u8>>) -> Result<()> {
-        for packet in packets {
+    async fn write_packets(&self, packets: &mut Vec<Vec<u8>>) -> Result<()> {
+        for packet in packets.drain(..) {
             let sample = Sample {
                 data: packet.into(),
                 timestamp: SystemTime::now(),
@@ -399,8 +454,8 @@ mod tests {
             .await
             .expect("session creation should succeed");
 
-        // One 20 ms frame of a 440 Hz sine wave at 48 kHz mono: 960 samples.
-        let frame_size = 48_000 * 20 / 1000;
+        // One default 10 ms frame of a 440 Hz sine wave at 48 kHz mono.
+        let frame_size = 48_000 * 10 / 1000;
         let mut frame: Vec<i16> = (0..frame_size)
             .map(|i| {
                 let t = i as f64 / 48_000.0;
@@ -412,6 +467,12 @@ mod tests {
             .send_audio(&mut frame)
             .await
             .expect("send_audio should succeed");
+        let packet_capacity = session.outgoing_packets.capacity();
+        session
+            .send_audio(&mut frame)
+            .await
+            .expect("second send_audio should succeed");
+        assert_eq!(session.outgoing_packets.capacity(), packet_capacity);
 
         session.close().await.expect("close should succeed");
     }
@@ -430,37 +491,44 @@ mod tests {
             ..Default::default()
         };
         let codec_config = config.codec.clone();
+        let frame_duration =
+            Duration::from_secs_f64(f64::from(codec_config.frame_size_ms) / 1_000.0);
         let pipeline = Arc::new(Mutex::new(AudioPipeline::new(config).unwrap()));
         let encoder = llm_rtc_core::audio::codec::OpusEncoder::new(codec_config).unwrap();
-        let frame = vec![1_000i16; encoder.samples_per_frame()];
+        let samples_per_frame = encoder.samples_per_frame();
+        let frame = vec![1_000i16; samples_per_frame];
 
-        for seq in 0..2u16 {
-            let packet = AudioPacket {
-                sequence_number: seq,
-                timestamp: u32::from(seq) * 960,
-                payload: encoder.encode(&frame).unwrap(),
-            };
-            assert!(pipeline.lock().unwrap().push_incoming(packet));
-        }
-
-        let (_receiver_done_tx, receiver_done_rx) = watch::channel(true);
+        let (receiver_done_tx, receiver_done_rx) = watch::channel(false);
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::unbounded_channel();
         let cb: RemoteAudioCallback = Arc::new(move |pcm| {
             let _ = frames_tx.send(pcm);
         });
+        let packet_ready = Arc::new(Notify::new());
         let task = spawn_playout_task(
             Arc::clone(&pipeline),
             cb,
-            Duration::from_millis(20),
+            frame_duration,
             receiver_done_rx,
+            Arc::clone(&packet_ready),
         );
+
+        for seq in 0..2u16 {
+            let packet = AudioPacket {
+                sequence_number: seq,
+                timestamp: u32::from(seq) * samples_per_frame as u32,
+                payload: encoder.encode(&frame).unwrap(),
+            };
+            assert!(pipeline.lock().unwrap().push_incoming(packet));
+        }
+        packet_ready.notify_one();
+        receiver_done_tx.send(true).unwrap();
 
         for _ in 0..2 {
             let pcm = tokio::time::timeout(Duration::from_millis(200), frames_rx.recv())
                 .await
                 .expect("playout frame timed out")
                 .expect("playout task closed the callback channel");
-            assert_eq!(pcm.len(), 960);
+            assert_eq!(pcm.len(), samples_per_frame);
         }
         tokio::time::timeout(Duration::from_millis(200), task)
             .await

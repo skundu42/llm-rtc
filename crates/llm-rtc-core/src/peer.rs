@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
@@ -19,6 +19,7 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp::header::Header;
+use webrtc::rtp::packet::Packet;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
 use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
@@ -58,13 +59,19 @@ pub struct RemoteTrack {
 impl RemoteTrack {
     /// Read the next RTP packet into `buf`.
     ///
-    /// Returns the RTP packet header and the payload size written into
-    /// `buf` (payload occupies the first `size` bytes of `buf`).
+    /// Returns the RTP packet header and the payload size written at the start
+    /// of `buf`. The track initially fills `buf` with the full wire packet.
     pub async fn read_rtp(&self, buf: &mut [u8]) -> Result<(Header, usize)> {
         let (pkt, _) = self.track.read(buf).await?;
-        let n = pkt.payload.len();
-        Ok((pkt.header, n))
+        copy_rtp_payload(pkt, buf)
     }
+}
+
+fn copy_rtp_payload(packet: Packet, buf: &mut [u8]) -> Result<(Header, usize)> {
+    let n = packet.payload.len();
+    ensure!(n <= buf.len(), "RTP payload exceeds receive buffer");
+    buf[..n].copy_from_slice(&packet.payload);
+    Ok((packet.header, n))
 }
 
 /// Handle wrapping a WebRTC [`RTCPeerConnection`].
@@ -199,9 +206,27 @@ fn parse_bundle_policy(s: &str) -> RTCBundlePolicy {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use webrtc::track::track_local::TrackLocal;
 
     use super::*;
+
+    #[test]
+    fn read_rtp_copies_only_the_parsed_payload() {
+        let packet = Packet {
+            header: Header {
+                sequence_number: 42,
+                ..Default::default()
+            },
+            payload: Bytes::from_static(b"opus"),
+        };
+        let mut wire_scratch = [0x80; 16];
+
+        let (header, n) = copy_rtp_payload(packet, &mut wire_scratch).unwrap();
+
+        assert_eq!(header.sequence_number, 42);
+        assert_eq!(&wire_scratch[..n], b"opus");
+    }
 
     #[tokio::test]
     async fn test_new_succeeds_with_default_config() {

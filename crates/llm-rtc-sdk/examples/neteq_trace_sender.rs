@@ -8,8 +8,10 @@
 use std::cmp::Ordering;
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -33,12 +35,14 @@ use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::TrackLocalWriter;
 
 const SAMPLE_RATE: u32 = 48_000;
-const FRAME_MS: u64 = 20;
-const SAMPLES_PER_FRAME: usize = 960;
-const CONTENT_FRAMES: usize = 500;
-const GUARD_FRAMES: usize = 5;
+const FRAME_MS: u64 = 10;
+const PLAYOUT_POLL_MS: u64 = FRAME_MS / 2;
+const SAMPLES_PER_FRAME: usize = 480;
+const CONTENT_FRAMES: usize = 1_000;
+const GUARD_FRAMES: usize = 10;
 const START_SEQUENCE: u16 = 10_000;
 const START_TIMESTAMP: u32 = 900_000;
+const DEFAULT_TARGET_LATENCY_MS: u32 = 5;
 
 #[derive(Clone, Copy)]
 struct NetworkProfile {
@@ -103,17 +107,46 @@ struct TraceRow {
 struct LocalMetrics {
     engine: &'static str,
     profile: String,
+    max_latency_ms: u32,
+    target_latency_ms: u32,
     content_frames: usize,
     network_packets_lost: usize,
     continuity_pct: f64,
     normal_frames: usize,
     fec_frames: usize,
+    fec_rate_pct: f64,
     plc_frames: usize,
+    plc_rate_pct: f64,
     concealment_rate_pct: f64,
+    late_drops: u64,
+    adaptive_target_latency_ms: f32,
     p50_playout_delay_ms: f64,
     p95_playout_delay_ms: f64,
     p99_playout_delay_ms: f64,
+    first_content_playout_ms: f64,
+    last_content_playout_end_ms: f64,
+    content_playout_timeline: Vec<PlayoutPoint>,
     median_cpu_ms_per_audio_second: f64,
+    peak_rss_mib: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct PlayoutPoint {
+    sample_offset: usize,
+    sample_count: usize,
+    elapsed_ms: f64,
+}
+
+#[derive(Serialize)]
+struct LoadMetrics {
+    engine: &'static str,
+    profile: String,
+    concurrent_calls: usize,
+    repetitions: usize,
+    max_latency_ms: u32,
+    target_latency_ms: u32,
+    median_cpu_ms_per_audio_second_per_call: f64,
+    median_batch_wall_ms: f64,
     peak_rss_mib: f64,
 }
 
@@ -124,6 +157,11 @@ struct LocalRun {
     plc_frames: usize,
     output_frames: usize,
     delays_ms: Vec<f64>,
+    late_drops: u64,
+    adaptive_target_latency_ms: f32,
+    first_content_playout_ms: f64,
+    last_content_playout_end_ms: f64,
+    content_playout_timeline: Vec<PlayoutPoint>,
 }
 
 fn codec_config() -> CodecConfig {
@@ -209,7 +247,13 @@ fn encode_trace(pcm: &[i16], profile: NetworkProfile) -> Result<Vec<TracePacket>
     Ok(trace)
 }
 
-fn write_trace(path: &Path, profile: NetworkProfile, trace: &[TracePacket]) -> Result<()> {
+fn write_trace(
+    path: &Path,
+    profile: NetworkProfile,
+    trace: &[TracePacket],
+    max_latency_ms: u32,
+    target_latency_ms: u32,
+) -> Result<()> {
     let rows: Vec<_> = trace
         .iter()
         .map(|packet| TraceRow {
@@ -226,15 +270,20 @@ fn write_trace(path: &Path, profile: NetworkProfile, trace: &[TracePacket]) -> R
         "profile": profile.name,
         "sample_rate": SAMPLE_RATE,
         "frame_ms": FRAME_MS,
-        "target_latency_ms": 40,
-        "max_latency_ms": 120,
+        "target_latency_ms": target_latency_ms,
+        "max_latency_ms": max_latency_ms,
         "packets": rows,
     });
     fs::write(path, serde_json::to_vec_pretty(&document)?)?;
     Ok(())
 }
 
-fn run_local_once(trace: &[TracePacket]) -> Result<LocalRun> {
+fn run_local_once(
+    trace: &[TracePacket],
+    max_latency_ms: u32,
+    target_latency_ms: u32,
+    capture_pcm: bool,
+) -> Result<LocalRun> {
     let base = Instant::now();
     let clock_offset = Arc::new(Mutex::new(Duration::ZERO));
     let clock = {
@@ -242,8 +291,8 @@ fn run_local_once(trace: &[TracePacket]) -> Result<LocalRun> {
         Box::new(move || base + *clock_offset.lock().expect("benchmark clock poisoned"))
     };
     let config = JitterBufferConfig {
-        max_latency_ms: 120,
-        target_latency_ms: 40,
+        max_latency_ms,
+        target_latency_ms,
         max_packets: 100,
         sample_rate: SAMPLE_RATE,
         frame_size_ms: FRAME_MS as u32,
@@ -259,12 +308,19 @@ fn run_local_once(trace: &[TracePacket]) -> Result<LocalRun> {
     });
 
     let mut next_arrival = 0;
-    let mut output = Vec::with_capacity(CONTENT_FRAMES * SAMPLES_PER_FRAME);
+    let mut output = if capture_pcm {
+        Vec::with_capacity(CONTENT_FRAMES * SAMPLES_PER_FRAME)
+    } else {
+        Vec::new()
+    };
     let mut normal_frames = 0;
     let mut fec_frames = 0;
     let mut plc_frames = 0;
     let mut output_frames = 0;
     let mut delays_ms = Vec::new();
+    let mut first_content_playout_ms = None;
+    let mut last_content_playout_end_ms = 0.0;
+    let mut content_playout_timeline = Vec::with_capacity(CONTENT_FRAMES);
     let end_ms = trace
         .iter()
         .map(|packet| packet.arrival_ms)
@@ -287,7 +343,9 @@ fn run_local_once(trace: &[TracePacket]) -> Result<LocalRun> {
         *clock_offset.lock().expect("benchmark clock poisoned") =
             Duration::from_secs_f64(tick_ms / 1_000.0);
 
-        while let Some(event) = jitter.pop_event() {
+        // Match the SDK's controlled recovery clock: emit at most one frame
+        // per half-frame poll, even when several RTP deadlines are overdue.
+        if let Some(event) = jitter.pop_event() {
             let (sequence_number, pcm, kind) = match event {
                 PlayoutEvent::Packet(packet) => {
                     let decoded = decoder.decode(&packet.payload)?;
@@ -314,8 +372,18 @@ fn run_local_once(trace: &[TracePacket]) -> Result<LocalRun> {
             };
             let frame_index = usize::from(sequence_number.wrapping_sub(START_SEQUENCE));
             if frame_index < CONTENT_FRAMES {
-                output.extend_from_slice(&pcm[..pcm.len().min(SAMPLES_PER_FRAME)]);
+                if capture_pcm {
+                    output.extend_from_slice(&pcm[..pcm.len().min(SAMPLES_PER_FRAME)]);
+                }
                 output_frames += 1;
+                first_content_playout_ms.get_or_insert(tick_ms);
+                // The full decoded frame is available to ASR at callback time.
+                last_content_playout_end_ms = tick_ms;
+                content_playout_timeline.push(PlayoutPoint {
+                    sample_offset: frame_index * SAMPLES_PER_FRAME,
+                    sample_count: SAMPLES_PER_FRAME,
+                    elapsed_ms: tick_ms,
+                });
                 match kind {
                     0 => normal_frames += 1,
                     1 => fec_frames += 1,
@@ -323,9 +391,10 @@ fn run_local_once(trace: &[TracePacket]) -> Result<LocalRun> {
                 }
             }
         }
-        tick_ms += FRAME_MS as f64;
+        tick_ms += PLAYOUT_POLL_MS as f64;
     }
 
+    let stats = jitter.stats();
     Ok(LocalRun {
         pcm: output,
         normal_frames,
@@ -333,6 +402,11 @@ fn run_local_once(trace: &[TracePacket]) -> Result<LocalRun> {
         plc_frames,
         output_frames,
         delays_ms,
+        late_drops: stats.packets_late,
+        adaptive_target_latency_ms: stats.current_target_latency_ms,
+        first_content_playout_ms: first_content_playout_ms.unwrap_or(0.0),
+        last_content_playout_end_ms,
+        content_playout_timeline,
     })
 }
 
@@ -358,21 +432,53 @@ fn peak_rss_mib() -> f64 {
         .map_or(0.0, |kib| kib / 1_024.0)
 }
 
-fn run_llm_only(profile: NetworkProfile, input: &Path, output_dir: &Path) -> Result<()> {
+fn process_cpu_time() -> Result<Duration> {
+    let mut usage = MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` initializes the pointed-to `rusage` on success, and
+    // the pointer is valid for the duration of the call.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error()).context("reading process CPU usage");
+    }
+    // SAFETY: the successful `getrusage` call above initialized `usage`.
+    let usage = unsafe { usage.assume_init() };
+    let timeval = |value: libc::timeval| -> Result<Duration> {
+        let seconds = u64::try_from(value.tv_sec).context("negative CPU seconds")?;
+        let micros = u32::try_from(value.tv_usec).context("invalid CPU microseconds")?;
+        Ok(Duration::new(seconds, micros * 1_000))
+    };
+    Ok(timeval(usage.ru_utime)? + timeval(usage.ru_stime)?)
+}
+
+fn run_llm_only(
+    profile: NetworkProfile,
+    input: &Path,
+    output_dir: &Path,
+    max_latency_ms: u32,
+    target_latency_ms: u32,
+) -> Result<()> {
     fs::create_dir_all(output_dir)?;
     let pcm = read_pcm(input)?;
     let trace = encode_trace(&pcm, profile)?;
-    write_trace(&output_dir.join("trace.json"), profile, &trace)?;
+    write_trace(
+        &output_dir.join("trace.json"),
+        profile,
+        &trace,
+        max_latency_ms,
+        target_latency_ms,
+    )?;
 
-    let quality_run = run_local_once(&trace)?;
+    let quality_run = run_local_once(&trace, max_latency_ms, target_latency_ms, true)?;
     write_pcm(&output_dir.join("llm-rtc.pcm"), &quality_run.pcm)?;
 
     let mut cpu_samples = Vec::new();
     for _ in 0..21 {
-        let started = Instant::now();
-        let run = run_local_once(&trace)?;
+        let started = process_cpu_time()?;
+        let run = run_local_once(&trace, max_latency_ms, target_latency_ms, false)?;
         std::hint::black_box(run.output_frames);
-        cpu_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let elapsed = process_cpu_time()?
+            .checked_sub(started)
+            .context("process CPU clock moved backwards")?;
+        cpu_samples.push(elapsed.as_secs_f64() * 1_000.0);
     }
     cpu_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     let median_cpu_ms = cpu_samples[cpu_samples.len() / 2];
@@ -383,21 +489,99 @@ fn run_llm_only(profile: NetworkProfile, input: &Path, output_dir: &Path) -> Res
     let metrics = LocalMetrics {
         engine: "llm-rtc",
         profile: profile.name.to_string(),
+        max_latency_ms,
+        target_latency_ms,
         content_frames: CONTENT_FRAMES,
         network_packets_lost,
         continuity_pct: quality_run.output_frames as f64 / CONTENT_FRAMES as f64 * 100.0,
         normal_frames: quality_run.normal_frames,
         fec_frames: quality_run.fec_frames,
+        fec_rate_pct: quality_run.fec_frames as f64 / CONTENT_FRAMES as f64 * 100.0,
         plc_frames: quality_run.plc_frames,
+        plc_rate_pct: quality_run.plc_frames as f64 / CONTENT_FRAMES as f64 * 100.0,
         concealment_rate_pct: quality_run.plc_frames as f64 / CONTENT_FRAMES as f64 * 100.0,
+        late_drops: quality_run.late_drops,
+        adaptive_target_latency_ms: quality_run.adaptive_target_latency_ms,
         p50_playout_delay_ms: percentile(&quality_run.delays_ms, 0.50),
         p95_playout_delay_ms: percentile(&quality_run.delays_ms, 0.95),
         p99_playout_delay_ms: percentile(&quality_run.delays_ms, 0.99),
+        first_content_playout_ms: quality_run.first_content_playout_ms,
+        last_content_playout_end_ms: quality_run.last_content_playout_end_ms,
+        content_playout_timeline: quality_run.content_playout_timeline,
         median_cpu_ms_per_audio_second: median_cpu_ms / 10.0,
         peak_rss_mib: peak_rss_mib(),
     };
     fs::write(
         output_dir.join("llm-rtc.json"),
+        serde_json::to_vec_pretty(&metrics)?,
+    )?;
+    Ok(())
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    values[values.len() / 2]
+}
+
+fn run_llm_load(
+    profile: NetworkProfile,
+    input: &Path,
+    output_dir: &Path,
+    max_latency_ms: u32,
+    target_latency_ms: u32,
+    concurrent_calls: usize,
+    repetitions: usize,
+) -> Result<()> {
+    if concurrent_calls == 0 || repetitions == 0 {
+        bail!("concurrent-calls and repetitions must be positive");
+    }
+    fs::create_dir_all(output_dir)?;
+    let pcm = read_pcm(input)?;
+    let trace = Arc::new(encode_trace(&pcm, profile)?);
+    let mut cpu_samples = Vec::with_capacity(repetitions);
+    let mut wall_samples = Vec::with_capacity(repetitions);
+
+    for _ in 0..repetitions {
+        let cpu_started = process_cpu_time()?;
+        let wall_started = Instant::now();
+        let mut workers = Vec::with_capacity(concurrent_calls);
+        for _ in 0..concurrent_calls {
+            let trace = Arc::clone(&trace);
+            workers.push(thread::spawn(move || {
+                run_local_once(trace.as_slice(), max_latency_ms, target_latency_ms, false)
+            }));
+        }
+        for worker in workers {
+            let run = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("load worker panicked"))??;
+            if run.output_frames != CONTENT_FRAMES {
+                bail!("load worker produced an incomplete stream");
+            }
+        }
+        let cpu_elapsed = process_cpu_time()?
+            .checked_sub(cpu_started)
+            .context("process CPU clock moved backwards")?;
+        cpu_samples.push(
+            cpu_elapsed.as_secs_f64() * 1_000.0
+                / (concurrent_calls as f64 * CONTENT_FRAMES as f64 * FRAME_MS as f64 / 1_000.0),
+        );
+        wall_samples.push(wall_started.elapsed().as_secs_f64() * 1_000.0);
+    }
+
+    let metrics = LoadMetrics {
+        engine: "llm-rtc",
+        profile: profile.name.to_string(),
+        concurrent_calls,
+        repetitions,
+        max_latency_ms,
+        target_latency_ms,
+        median_cpu_ms_per_audio_second_per_call: median(&mut cpu_samples),
+        median_batch_wall_ms: median(&mut wall_samples),
+        peak_rss_mib: peak_rss_mib(),
+    };
+    fs::write(
+        output_dir.join("llm-rtc-load.json"),
         serde_json::to_vec_pretty(&metrics)?,
     )?;
     Ok(())
@@ -445,7 +629,13 @@ async fn run_neteq_sender(profile: NetworkProfile, input: &Path, output_dir: &Pa
     fs::create_dir_all(output_dir)?;
     let pcm = read_pcm(input)?;
     let trace = encode_trace(&pcm, profile)?;
-    write_trace(&output_dir.join("trace.json"), profile, &trace)?;
+    write_trace(
+        &output_dir.join("trace.json"),
+        profile,
+        &trace,
+        120,
+        DEFAULT_TARGET_LATENCY_MS,
+    )?;
 
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
@@ -528,7 +718,7 @@ async fn run_neteq_sender(profile: NetworkProfile, input: &Path, output_dir: &Pa
 
 fn usage() -> ! {
     eprintln!(
-        "usage: neteq_trace_sender <llm-only|neteq-sender> <clean|moderate|severe> <input.pcm> <output-dir>"
+        "usage:\n  neteq_trace_sender llm-only <profile> <input.pcm> <output-dir> [max-latency-ms] [target-latency-ms]\n  neteq_trace_sender neteq-sender <profile> <input.pcm> <output-dir>\n  neteq_trace_sender llm-load <profile> <input.pcm> <output-dir> <max-latency-ms> <target-latency-ms> <concurrent-calls> <repetitions>"
     );
     std::process::exit(2);
 }
@@ -536,15 +726,46 @@ fn usage() -> ! {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 {
+    if args.len() < 5 {
         usage();
     }
     let profile = NetworkProfile::parse(&args[2])?;
     let input = PathBuf::from(&args[3]);
     let output_dir = PathBuf::from(&args[4]);
     match args[1].as_str() {
-        "llm-only" => run_llm_only(profile, &input, &output_dir),
-        "neteq-sender" => run_neteq_sender(profile, &input, &output_dir).await,
+        "llm-only" if (5..=7).contains(&args.len()) => {
+            let max_latency_ms = args
+                .get(5)
+                .map_or(Ok(120), |value| value.parse::<u32>())
+                .context("max-latency-ms must be an integer")?;
+            let target_latency_ms = args
+                .get(6)
+                .map_or(Ok(DEFAULT_TARGET_LATENCY_MS), |value| value.parse::<u32>())
+                .context("target-latency-ms must be an integer")?;
+            run_llm_only(
+                profile,
+                &input,
+                &output_dir,
+                max_latency_ms,
+                target_latency_ms,
+            )
+        }
+        "neteq-sender" if args.len() == 5 => run_neteq_sender(profile, &input, &output_dir).await,
+        "llm-load" if args.len() == 9 => run_llm_load(
+            profile,
+            &input,
+            &output_dir,
+            args[5]
+                .parse()
+                .context("max-latency-ms must be an integer")?,
+            args[6]
+                .parse()
+                .context("target-latency-ms must be an integer")?,
+            args[7]
+                .parse()
+                .context("concurrent-calls must be an integer")?,
+            args[8].parse().context("repetitions must be an integer")?,
+        ),
         _ => usage(),
     }
 }
